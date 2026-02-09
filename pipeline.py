@@ -10,7 +10,10 @@ import numpy as np
 from PIL import Image
 
 import stitch
-import hsb_adjust
+from hsv import hsb_adjust
+
+# need to do: create + save color histograms?
+# or maybe add a param to optionally save histograms
 
 JPEG_QUALITY = 98
 
