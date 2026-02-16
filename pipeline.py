@@ -12,6 +12,9 @@ from PIL import Image
 import stitch
 from hsv import hsb_adjust
 
+# NEW: ML method
+from ml_infer import MLParams, apply_bgr_ml
+
 # need to do: create + save color histograms?
 # or maybe add a param to optionally save histograms
 
@@ -140,6 +143,13 @@ def run_pipeline(
     overwrite: bool = False,
     skip_stitch: bool = False,
     stitched_root: Optional[str] = None,
+    # NEW:
+    method: str = "hsv",
+    checkpoint: Optional[str] = None,
+    device: str = "cuda",
+    tile_size: int = 512,
+    overlap: int = 32,
+    normalize: str = "0_1",
 ) -> None:
     ensure_dir(stitched_out)
     ensure_dir(final_out)
@@ -174,6 +184,33 @@ def run_pipeline(
         "white_v_lo": 150,
     }
 
+    # Helper to apply chosen method
+    def _apply_method(bgr: np.ndarray, meta_in: dict):
+        if method == "hsv":
+            bgr_adj, meta = hsb_adjust.adjust_bgr_image_hsb(
+                bgr,
+                params=hsb_params,
+                metadata=meta_in,
+            )
+            return _ensure_bgr_u8(bgr_adj), meta
+
+        if method == "ml":
+            if not checkpoint:
+                raise ValueError("--checkpoint is required when --method ml")
+
+            ml_params = MLParams(
+                checkpoint=checkpoint,
+                device=device,
+                tile_size=tile_size,
+                overlap=overlap,
+                use_amp=True,
+                normalize=normalize,
+            )
+            bgr_adj, meta = apply_bgr_ml(bgr, ml_params)
+            return _ensure_bgr_u8(bgr_adj), meta
+
+        raise ValueError(f"Unknown method: {method}")
+
     if skip_stitch:
         if not stitched_root:
             raise ValueError("--skip-stitch requires --stitched-root")
@@ -200,19 +237,16 @@ def run_pipeline(
             bgr = _read_bmp(bmp_path)
 
             # NOTE: For huge stitched BMPs, rewriting a copy can be slow / fail.
-            # If you want, comment out the next two lines.
             save_bmp(stitched_bmp_path, bgr)
             print(f"  stitched (input) -> {stitched_bmp_path}  shape={bgr.shape} dtype={bgr.dtype}")
 
-            bgr_adj, meta = hsb_adjust.adjust_bgr_image_hsb(
-                bgr,
-                params=hsb_params,
-                metadata={"source_bmp": str(bmp_path)},
-            )
-            bgr_adj = _ensure_bgr_u8(bgr_adj)
+            bgr_adj, meta = _apply_method(bgr, {"source_bmp": str(bmp_path), "method": method})
 
-            print(f"  adjust counts: {meta.get('counts')}")
-            print(f"  version: {meta.get('version')}")
+            if method == "hsv":
+                print(f"  adjust counts: {meta.get('counts')}")
+                print(f"  version: {meta.get('version')}")
+            else:
+                print(f"  ml meta: {meta}")
 
             written_path, written_fmt = save_final_image_with_fallback(
                 final_jpg_path, bgr_adj, quality=JPEG_QUALITY
@@ -250,15 +284,13 @@ def run_pipeline(
         save_bmp(stitched_bmp_path, bgr)
         print(f"  stitched -> {stitched_bmp_path}  shape={bgr.shape} dtype={bgr.dtype}")
 
-        bgr_adj, meta = hsb_adjust.adjust_bgr_image_hsb(
-            bgr,
-            params=hsb_params,
-            metadata={"source_folder": name},
-        )
-        bgr_adj = _ensure_bgr_u8(bgr_adj)
+        bgr_adj, meta = _apply_method(bgr, {"source_folder": name, "method": method})
 
-        print(f"  adjust counts: {meta.get('counts')}")
-        print(f"  version: {meta.get('version')}")
+        if method == "hsv":
+            print(f"  adjust counts: {meta.get('counts')}")
+            print(f"  version: {meta.get('version')}")
+        else:
+            print(f"  ml meta: {meta}")
 
         written_path, written_fmt = save_final_image_with_fallback(
             final_jpg_path, bgr_adj, quality=JPEG_QUALITY
@@ -268,6 +300,7 @@ def run_pipeline(
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Stitching + HSB adjustment pipeline (supports stitched BMP mode)")
+
     ap.add_argument("--raw-root", help="Folder containing raw tile subfolders (stitch mode)")
     ap.add_argument("--stitched-out", default="stitched_bmps", help="Where to write stitched BMPs (and/or copies)")
     ap.add_argument("--final-out", default="final_outputs", help="Where to write final JPG/PNG")
@@ -276,6 +309,17 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--skip-stitch", action="store_true", help="Skip stitching; process already-stitched BMPs")
     ap.add_argument("--stitched-root", help="Folder containing stitched .bmp files (required with --skip-stitch)")
+
+    # NEW: method switch
+    ap.add_argument("--method", choices=["hsv", "ml"], default="hsv", help="Colorization method")
+
+    # NEW: ML params (used if --method ml)
+    ap.add_argument("--checkpoint", default=None, help="Path to PyTorch checkpoint for ML method (.pt)")
+    ap.add_argument("--device", default="cuda", help="cuda or cpu")
+    ap.add_argument("--tile-size", type=int, default=512, help="ML inference tile size")
+    ap.add_argument("--overlap", type=int, default=32, help="ML inference overlap")
+    ap.add_argument("--normalize", choices=["none", "0_1", "imagenet"], default="0_1", help="ML normalization mode")
+
     return ap.parse_args()
 
 
@@ -289,6 +333,12 @@ def main() -> None:
         overwrite=args.overwrite,
         skip_stitch=args.skip_stitch,
         stitched_root=args.stitched_root,
+        method=args.method,
+        checkpoint=args.checkpoint,
+        device=args.device,
+        tile_size=args.tile_size,
+        overlap=args.overlap,
+        normalize=args.normalize,
     )
 
 

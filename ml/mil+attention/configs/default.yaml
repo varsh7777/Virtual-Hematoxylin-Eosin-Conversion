@@ -1,0 +1,40 @@
+seed: 1337
+
+data:
+  raw_dir: "data/raw"         # folder of raw images
+  he_dir: "data/he"           # folder of target H&E images (same filenames)
+  ext: [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]
+  patch_size: 256
+  bag_size: 16                # N patches per image (bag size)
+  num_workers: 4
+
+train:
+  epochs: 20
+  batch_size: 2               # number of bags per batch
+  lr: 0.0002
+  weight_decay: 0.0001
+  amp: true
+  grad_clip: 1.0
+  log_every: 20
+  save_every: 1
+
+loss:
+  lambda_recon: 1.0
+  lambda_gan: 0.0             # set >0 to enable GAN
+  attention_weighted_recon: true
+
+model:
+  generator:
+    base_channels: 64
+  encoder:
+    embed_dim: 256
+  attention:
+    type: "gated"             # "gated" or "plain"
+
+gan:
+  d_base_channels: 64
+  gan_mode: "lsgan"           # "lsgan" or "bce"
+
+output:
+  out_dir: "runs/mil_he"
+  save_best: true

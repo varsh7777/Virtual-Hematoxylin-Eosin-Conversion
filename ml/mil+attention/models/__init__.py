@@ -1,6 +1,3 @@
-# image_metrics
-# PSNR, SSIM, LPIPS (if used), color ΔE (CIELAB), etc
-
 import torch
 import torch.nn.functional as F
 
