@@ -1,4 +1,4 @@
-# pipeline.py (Version G - with safe BMP read + pink bias params)
+# pipeline.py (Version G - ML compatible; safe BMP read; uses your DEFAULTS + brightness lift)
 # Python 3.8/3.9 compatible
 
 import argparse
@@ -12,11 +12,7 @@ from PIL import Image
 import stitch
 from hsv import hsb_adjust
 
-# NEW: ML method
 from ml_infer import MLParams, apply_bgr_ml
-
-# need to do: create + save color histograms?
-# or maybe add a param to optionally save histograms
 
 JPEG_QUALITY = 98
 
@@ -35,6 +31,13 @@ def list_bmps(root: Union[str, Path]) -> List[Path]:
     if not root_p.exists():
         return []
     return sorted([p for p in root_p.iterdir() if p.is_file() and p.suffix.lower() == ".bmp"])
+
+
+def list_svs(root: Union[str, Path]) -> List[Path]:
+    root_p = Path(root)
+    if not root_p.exists():
+        return []
+    return sorted([p for p in root_p.rglob("*.svs") if p.is_file()])
 
 
 def _ensure_bgr_u8(img: np.ndarray) -> np.ndarray:
@@ -94,29 +97,33 @@ def save_final_image_with_fallback(
     bgr: np.ndarray,
     quality: int,
 ) -> Tuple[Path, str]:
+    """
+    Always save as PNG (lossless).
+    No JPEG.
+    No lossy compression.
+    Full resolution preserved.
+    """
+
     bgr = _ensure_bgr_u8(bgr)
-    h, w = bgr.shape[:2]
 
-    if w > 65000 or h > 65000:
-        png_path = Path(final_jpg_path).with_suffix(".png")
-        save_png(png_path, bgr)
-        return png_path, "png (auto, JPEG dimension limit)"
+    final_png_path = Path(final_jpg_path).with_suffix(".png")
 
-    if _try_save_jpeg_opencv(final_jpg_path, bgr, quality):
-        return Path(final_jpg_path), "jpg (opencv)"
+    ok = cv2.imwrite(
+        str(final_png_path),
+        bgr,
+        [cv2.IMWRITE_PNG_COMPRESSION, 0],  # 0 = no compression (lossless)
+    )
 
-    if _try_save_jpeg_pillow(final_jpg_path, bgr, quality):
-        return Path(final_jpg_path), "jpg (pillow)"
+    if not ok:
+        raise RuntimeError(f"Failed to write PNG: {final_png_path}")
 
-    png_path = Path(final_jpg_path).with_suffix(".png")
-    save_png(png_path, bgr)
-    return png_path, "png (fallback, JPEG write failed)"
+    return final_png_path, "png (lossless, no compression)"
 
 
 def _read_bmp(path: Union[str, Path]) -> np.ndarray:
     """
-    OpenCV BMP decoder fails for very large BMPs (~>=1GB decoded).
-    This function tries OpenCV first, then falls back to Pillow.
+    OpenCV BMP decoder can fail for very large BMPs (~>=1GB decoded).
+    Try OpenCV first, then fall back to Pillow.
     """
     path = Path(path)
 
@@ -124,7 +131,6 @@ def _read_bmp(path: Union[str, Path]) -> np.ndarray:
     if img is not None:
         return _ensure_bgr_u8(img)
 
-    # Pillow fallback
     try:
         with Image.open(str(path)) as im:
             im = im.convert("RGB")
@@ -135,6 +141,17 @@ def _read_bmp(path: Union[str, Path]) -> np.ndarray:
         raise RuntimeError(f"Failed to read BMP with OpenCV and Pillow: {path}\n{e}")
 
 
+def _read_svs(path: Union[str, Path], level: int = 0) -> np.ndarray:
+    from openslide import OpenSlide
+    path = Path(path)
+    slide = OpenSlide(str(path))
+    w, h = slide.level_dimensions[level]
+    rgba = np.array(slide.read_region((0, 0), level, (w, h)), dtype=np.uint8)  # RGBA
+    rgb = rgba[:, :, :3]
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    return _ensure_bgr_u8(bgr)
+
+
 def run_pipeline(
     raw_root: Optional[str],
     stitched_out: str,
@@ -143,48 +160,55 @@ def run_pipeline(
     overwrite: bool = False,
     skip_stitch: bool = False,
     stitched_root: Optional[str] = None,
-    # NEW:
     method: str = "hsv",
     checkpoint: Optional[str] = None,
     device: str = "cuda",
     tile_size: int = 512,
     overlap: int = 32,
     normalize: str = "0_1",
+    svs_root: Optional[str] = None,
+    svs_level: int = 0,
 ) -> None:
     ensure_dir(stitched_out)
     ensure_dir(final_out)
 
-    # Tuned params (pink-leaning, less purple)
+    # Your exact defaults + NEW brightness lift
     hsb_params = {
         "chunk_width": 1024,
         "do_hue": True,
         "do_sat": True,
         "do_bri": True,
 
-        # keep saturation under control
-        "sat_floor_tissue": 20,
+        "white_s_hi": 55,
+        "white_v_lo": 150,
+        "min_sat_for_hue": 15,
+        "nuclei_dark_v_thresh": 115,
+
+        "gamma_lift": 0.75,
+        "gamma_compress": 2.2,
+
+        "sat_floor_tissue": 0,
         "sat_push_nuclei": 0.05,
-        "sat_push_cyto": 0.22,
+        "sat_push_cyto": 0.12,
 
-        # brighten nuclei
-        "v_gamma_nuclei": 0.30,
-        "v_gamma_cyto": 0.82,
-        "v_floor_nuclei": 97,
+        "v_gamma_nuclei": 0.55,
+        "v_gamma_cyto": 0.92,
+        "v_floor_nuclei": 95,
+        "v_floor_cyto": 0,
 
-        # conservative hue pulls + NEW pink bias (negative values -> more pink)
         "hue_pull_nuclei": 0.03,
         "hue_pull_cyto": 0.05,
+
         "hue_bias_nuclei": -10,
         "hue_bias_cyto": -14,
 
-        # background pink stabilization
         "white_hue_center": 140,
         "white_hue_strength": 0.22,
-        "white_s_hi": 55,
-        "white_v_lo": 150,
+
+        # NEW: brighten everything a bit
+        "v_offset_all": 45,  # try 10..30
     }
 
-    # Helper to apply chosen method
     def _apply_method(bgr: np.ndarray, meta_in: dict):
         if method == "hsv":
             bgr_adj, meta = hsb_adjust.adjust_bgr_image_hsb(
@@ -211,6 +235,49 @@ def run_pipeline(
 
         raise ValueError(f"Unknown method: {method}")
 
+    # ------------------------------------------------------------------ #
+    #  SVS mode                                                            #
+    # ------------------------------------------------------------------ #
+    if svs_root:
+        svs_paths = list_svs(svs_root)
+        if not svs_paths:
+            print(f"No .svs files found under: {svs_root}")
+            return
+
+        print(f"Found {len(svs_paths)} SVS files under: {svs_root}")
+
+        for idx, svs_path in enumerate(svs_paths, 1):
+            name = svs_path.stem
+            final_jpg_path = Path(final_out) / f"{name}.jpg"
+
+            if not overwrite:
+                if final_jpg_path.exists() or final_jpg_path.with_suffix(".png").exists():
+                    print(f"[{idx}/{len(svs_paths)}] SKIP (exists): {name}")
+                    continue
+
+            print(f"\n[{idx}/{len(svs_paths)}] Processing SVS: {svs_path.name}")
+
+            bgr = _read_svs(svs_path, level=svs_level)
+            print(f"  read SVS -> shape={bgr.shape} dtype={bgr.dtype} level={svs_level}")
+
+            bgr_adj, meta = _apply_method(bgr, {"source_svs": str(svs_path), "method": method})
+
+            if method == "hsv":
+                print(f"  adjust counts: {meta.get('counts')}")
+                print(f"  version: {meta.get('version')}")
+            else:
+                print(f"  ml meta: {meta}")
+
+            written_path, written_fmt = save_final_image_with_fallback(
+                final_jpg_path, bgr_adj, quality=JPEG_QUALITY
+            )
+            print(f"  saved -> {written_path}  ({written_fmt})")
+
+        return
+
+    # ------------------------------------------------------------------ #
+    #  Skip-stitch mode (already-stitched BMPs)                           #
+    # ------------------------------------------------------------------ #
     if skip_stitch:
         if not stitched_root:
             raise ValueError("--skip-stitch requires --stitched-root")
@@ -236,9 +303,13 @@ def run_pipeline(
 
             bgr = _read_bmp(bmp_path)
 
-            # NOTE: For huge stitched BMPs, rewriting a copy can be slow / fail.
-            save_bmp(stitched_bmp_path, bgr)
-            print(f"  stitched (input) -> {stitched_bmp_path}  shape={bgr.shape} dtype={bgr.dtype}")
+            try:
+                save_bmp(stitched_bmp_path, bgr)
+                print(f"  stitched (input) -> {stitched_bmp_path}  shape={bgr.shape} dtype={bgr.dtype}")
+            except Exception as e:
+                print(f"  [WARN] Could not write stitched BMP (skipping): {stitched_bmp_path}")
+                print(f"         Reason: {e}")
+                print(f"  stitched -> (not saved)  shape={bgr.shape} dtype={bgr.dtype}")
 
             bgr_adj, meta = _apply_method(bgr, {"source_bmp": str(bmp_path), "method": method})
 
@@ -255,9 +326,11 @@ def run_pipeline(
 
         return
 
-    # ---- Original mode: stitch from raw folders of tiles ----
+    # ------------------------------------------------------------------ #
+    #  Normal stitch mode (raw tile subfolders)                           #
+    # ------------------------------------------------------------------ #
     if raw_root is None:
-        raise ValueError("raw_root is required unless --skip-stitch is used")
+        raise ValueError("raw_root is required unless --skip-stitch or --svs-root is used")
 
     folders = list_subfolders(raw_root)
     if not folders:
@@ -281,8 +354,13 @@ def run_pipeline(
         bgr = stitch.stitch_folder_to_image(str(folder), num_rows=num_rows)
         bgr = _ensure_bgr_u8(bgr)
 
-        save_bmp(stitched_bmp_path, bgr)
-        print(f"  stitched -> {stitched_bmp_path}  shape={bgr.shape} dtype={bgr.dtype}")
+        try:
+            save_bmp(stitched_bmp_path, bgr)
+            print(f"  stitched -> {stitched_bmp_path}  shape={bgr.shape} dtype={bgr.dtype}")
+        except Exception as e:
+            print(f"  [WARN] Could not write stitched BMP (skipping): {stitched_bmp_path}")
+            print(f"         Reason: {e}")
+            print(f"  stitched -> (not saved)  shape={bgr.shape} dtype={bgr.dtype}")
 
         bgr_adj, meta = _apply_method(bgr, {"source_folder": name, "method": method})
 
@@ -299,7 +377,7 @@ def run_pipeline(
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Stitching + HSB adjustment pipeline (supports stitched BMP mode)")
+    ap = argparse.ArgumentParser(description="Stitching + HSB adjustment pipeline (supports stitched BMP mode and SVS mode)")
 
     ap.add_argument("--raw-root", help="Folder containing raw tile subfolders (stitch mode)")
     ap.add_argument("--stitched-out", default="stitched_bmps", help="Where to write stitched BMPs (and/or copies)")
@@ -310,10 +388,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--skip-stitch", action="store_true", help="Skip stitching; process already-stitched BMPs")
     ap.add_argument("--stitched-root", help="Folder containing stitched .bmp files (required with --skip-stitch)")
 
-    # NEW: method switch
+    ap.add_argument("--svs-root", help="Folder containing .svs files to process directly (no stitching needed)")
+    ap.add_argument("--svs-level", type=int, default=0, help="SVS pyramid level to read (0 = full resolution)")
+
     ap.add_argument("--method", choices=["hsv", "ml"], default="hsv", help="Colorization method")
 
-    # NEW: ML params (used if --method ml)
     ap.add_argument("--checkpoint", default=None, help="Path to PyTorch checkpoint for ML method (.pt)")
     ap.add_argument("--device", default="cuda", help="cuda or cpu")
     ap.add_argument("--tile-size", type=int, default=512, help="ML inference tile size")
@@ -339,6 +418,8 @@ def main() -> None:
         tile_size=args.tile_size,
         overlap=args.overlap,
         normalize=args.normalize,
+        svs_root=args.svs_root,
+        svs_level=args.svs_level,
     )
 
 
