@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple
 
 import numpy as np
 import cv2
@@ -18,11 +18,11 @@ except Exception:
 @dataclass
 class MLParams:
     checkpoint: str
-    device: str = "cuda"        # "cuda" or "cpu"
-    tile_size: int = 512        # inference tile size
-    overlap: int = 32           # overlap to reduce seams
-    use_amp: bool = True        # mixed precision if on CUDA
-    normalize: str = "0_1"      # "none" | "0_1" | "imagenet"
+    device: str = "cuda"
+    tile_size: int = 512
+    overlap: int = 32
+    use_amp: bool = True
+    normalize: str = "0_1"
 
 
 def _normalize_rgb(rgb_f32_0_1: np.ndarray, mode: str) -> np.ndarray:
@@ -57,7 +57,6 @@ def _tile_coords(H: int, W: int, tile: int, overlap: int):
 
 
 def _make_weight_mask(tile: int) -> np.ndarray:
-    # Smooth 2D blending mask, shape [tile, tile, 1]
     yy = np.linspace(0, 1, tile, dtype=np.float32)
     xx = np.linspace(0, 1, tile, dtype=np.float32)
     wy = 0.5 - 0.5 * np.cos(np.clip(yy, 0, 1) * np.pi)
@@ -68,16 +67,13 @@ def _make_weight_mask(tile: int) -> np.ndarray:
 
 def _load_model_from_checkpoint(checkpoint_path: str, device: "torch.device") -> "nn.Module":
     """
-    This expects your checkpoint to be either:
-      - torch.save(model.state_dict(), path)
-      - torch.save({"model": model.state_dict()}, path)
+    Supports checkpoints saved as:
+      - {"G": state_dict}
+      - {"model": state_dict}
+      - state_dict directly
 
-    IMPORTANT:
-    Replace the placeholder model architecture below with your real generator.
-    The model should accept [B,3,H,W] floats and output [B,3,H,W] floats.
+    Replace Identity with your real generator when ready.
     """
-    # ---- PLACEHOLDER MODEL (identity) ----
-    # Replace this with your generator class, e.g. UNet/ResNet generator.
     class Identity(nn.Module):
         def forward(self, x):
             return x
@@ -85,7 +81,17 @@ def _load_model_from_checkpoint(checkpoint_path: str, device: "torch.device") ->
     model = Identity().to(device).eval()
 
     ckpt = torch.load(checkpoint_path, map_location=device)
-    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+
+    if isinstance(ckpt, dict):
+        if "G" in ckpt:
+            state = ckpt["G"]
+        elif "model" in ckpt:
+            state = ckpt["model"]
+        else:
+            state = ckpt
+    else:
+        state = ckpt
+
     model.load_state_dict(state, strict=False)
     return model
 
@@ -115,7 +121,6 @@ def apply_bgr_ml(bgr_u8: np.ndarray, params: MLParams) -> Tuple[np.ndarray, Dict
     tile = int(params.tile_size)
     overlap = int(params.overlap)
 
-    # Convert to RGB float [0,1]
     rgb = cv2.cvtColor(bgr_u8, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     rgb_n = _normalize_rgb(rgb, params.normalize)
 
@@ -127,7 +132,7 @@ def apply_bgr_ml(bgr_u8: np.ndarray, params: MLParams) -> Tuple[np.ndarray, Dict
 
     for y0 in ys:
         for x0 in xs:
-            patch = rgb_n[y0:y0 + tile, x0:x0 + tile, :]  # [tile,tile,3]
+            patch = rgb_n[y0:y0 + tile, x0:x0 + tile, :]
             t = torch.from_numpy(patch).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
 
             if use_amp:
@@ -136,7 +141,7 @@ def apply_bgr_ml(bgr_u8: np.ndarray, params: MLParams) -> Tuple[np.ndarray, Dict
             else:
                 y = model(t)
 
-            y = y[0].permute(1, 2, 0).detach().cpu().numpy().astype(np.float32)  # [tile,tile,3]
+            y = y[0].permute(1, 2, 0).detach().cpu().numpy().astype(np.float32)
             y = _denormalize_rgb(y, params.normalize)
             y = np.clip(y, 0.0, 1.0)
 

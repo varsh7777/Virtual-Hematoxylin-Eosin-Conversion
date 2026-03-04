@@ -1,4 +1,4 @@
-# pipeline.py (Version G - ML compatible; safe BMP read; uses your DEFAULTS + brightness lift)
+# pipeline.py (Version H++ - export-train-pairs supports huge TIFF targets safely)
 # Python 3.8/3.9 compatible
 
 import argparse
@@ -9,12 +9,14 @@ import cv2
 import numpy as np
 from PIL import Image
 
+import warnings
+
 import stitch
 from hsv import hsb_adjust
-
 from ml_infer import MLParams, apply_bgr_ml
 
 JPEG_QUALITY = 98
+SVS_MAX_DIM = 30000
 
 
 def ensure_dir(p: Union[str, Path]) -> None:
@@ -48,7 +50,7 @@ def _ensure_bgr_u8(img: np.ndarray) -> np.ndarray:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
     if img.ndim != 3 or img.shape[2] not in (3, 4):
-        raise ValueError(f"Unexpected image shape for save: {img.shape}")
+        raise ValueError(f"Unexpected image shape: {img.shape}")
 
     if img.shape[2] == 4:
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
@@ -85,48 +87,32 @@ def _try_save_jpeg_pillow(path: Union[str, Path], bgr: np.ndarray, quality: int)
         return False
 
 
-def save_png(path: Union[str, Path], bgr: np.ndarray) -> None:
-    bgr = _ensure_bgr_u8(bgr)
-    ok = cv2.imwrite(str(path), bgr)
-    if not ok:
-        raise RuntimeError(f"Failed to write PNG: {path}")
-
-
 def save_final_image_with_fallback(
     final_jpg_path: Union[str, Path],
     bgr: np.ndarray,
     quality: int,
 ) -> Tuple[Path, str]:
-    """
-    Always save as PNG (lossless).
-    No JPEG.
-    No lossy compression.
-    Full resolution preserved.
-    """
-
     bgr = _ensure_bgr_u8(bgr)
+    final_jpg_path = Path(final_jpg_path).with_suffix(".jpg")
 
+    if _try_save_jpeg_opencv(final_jpg_path, bgr, quality):
+        return final_jpg_path, f"jpeg (opencv, quality={quality})"
+
+    print("  [WARN] OpenCV JPEG write failed, trying Pillow...")
+    if _try_save_jpeg_pillow(final_jpg_path, bgr, quality):
+        return final_jpg_path, f"jpeg (pillow, quality={quality})"
+
+    print("  [WARN] Pillow JPEG write failed, falling back to PNG (light compression)...")
     final_png_path = Path(final_jpg_path).with_suffix(".png")
-
-    ok = cv2.imwrite(
-        str(final_png_path),
-        bgr,
-        [cv2.IMWRITE_PNG_COMPRESSION, 0],  # 0 = no compression (lossless)
-    )
-
+    ok = cv2.imwrite(str(final_png_path), bgr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
     if not ok:
         raise RuntimeError(f"Failed to write PNG: {final_png_path}")
 
-    return final_png_path, "png (lossless, no compression)"
+    return final_png_path, "png (fallback, compression=1)"
 
 
 def _read_bmp(path: Union[str, Path]) -> np.ndarray:
-    """
-    OpenCV BMP decoder can fail for very large BMPs (~>=1GB decoded).
-    Try OpenCV first, then fall back to Pillow.
-    """
     path = Path(path)
-
     img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if img is not None:
         return _ensure_bgr_u8(img)
@@ -138,18 +124,134 @@ def _read_bmp(path: Union[str, Path]) -> np.ndarray:
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             return _ensure_bgr_u8(bgr)
     except Exception as e:
-        raise RuntimeError(f"Failed to read BMP with OpenCV and Pillow: {path}\n{e}")
+        raise RuntimeError(f"Failed to read BMP: {path}\n{e}")
+
+
+def _read_tif(path: Union[str, Path]) -> np.ndarray:
+    """
+    Read huge TIF/TIFF as BGR uint8.
+
+    1) Try tifffile (best for large TIFFs).
+    2) Fall back to Pillow, disabling MAX_IMAGE_PIXELS limit for trusted local files.
+    """
+    path = Path(path)
+
+    # 1) tifffile first
+    try:
+        import tifffile  # type: ignore
+        arr = tifffile.imread(str(path))
+        # arr can be HxW, HxWx3, HxWx4, sometimes planar
+        if arr.ndim == 2:
+            rgb = np.stack([arr, arr, arr], axis=-1)
+        elif arr.ndim == 3:
+            if arr.shape[2] >= 3:
+                rgb = arr[:, :, :3]
+            else:
+                # weird channel layout
+                raise ValueError(f"Unexpected tif array shape: {arr.shape}")
+        else:
+            raise ValueError(f"Unexpected tif array ndim: {arr.ndim} shape={arr.shape}")
+
+        if rgb.dtype != np.uint8:
+            # common TIFF dtypes: uint16; scale down
+            if rgb.dtype == np.uint16:
+                rgb = (rgb / 257.0).astype(np.uint8)
+            else:
+                rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        return _ensure_bgr_u8(bgr)
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"  [WARN] tifffile failed on {path.name}, falling back to Pillow. Reason: {e}")
+
+    # 2) Pillow fallback (disable decompression-bomb protection for trusted files)
+    try:
+        Image.MAX_IMAGE_PIXELS = None  # you trust your local data
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # ignore DecompressionBombWarning
+            with Image.open(str(path)) as im:
+                im = im.convert("RGB")
+                rgb = np.array(im, dtype=np.uint8)
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                return _ensure_bgr_u8(bgr)
+    except Exception as e:
+        raise RuntimeError(f"Failed to read TIF: {path}\n{e}")
+
+
+def _sample_paired_patches(
+    raw_bgr: np.ndarray,
+    tgt_bgr: np.ndarray,
+    patch: int,
+    count: int,
+    seed: int = 1337,
+) -> List[Tuple[np.ndarray, np.ndarray, Tuple[int, int]]]:
+    if raw_bgr.shape[:2] != tgt_bgr.shape[:2]:
+        raise ValueError(f"raw/target size mismatch: raw={raw_bgr.shape[:2]} tgt={tgt_bgr.shape[:2]}")
+
+    H, W = raw_bgr.shape[:2]
+    if H < patch or W < patch:
+        raise ValueError(f"Image smaller than patch: img=({H},{W}) patch={patch}")
+
+    rng = np.random.RandomState(seed)
+    out = []
+    for _ in range(count):
+        y0 = int(rng.randint(0, H - patch + 1))
+        x0 = int(rng.randint(0, W - patch + 1))
+        rp = raw_bgr[y0:y0 + patch, x0:x0 + patch].copy()
+        tp = tgt_bgr[y0:y0 + patch, x0:x0 + patch].copy()
+        out.append((rp, tp, (x0, y0)))
+    return out
 
 
 def _read_svs(path: Union[str, Path], level: int = 0) -> np.ndarray:
     from openslide import OpenSlide
+
     path = Path(path)
     slide = OpenSlide(str(path))
-    w, h = slide.level_dimensions[level]
-    rgba = np.array(slide.read_region((0, 0), level, (w, h)), dtype=np.uint8)  # RGBA
-    rgb = rgba[:, :, :3]
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    return _ensure_bgr_u8(bgr)
+
+    num_levels = slide.level_count
+    print(f"  SVS levels: {num_levels}  dimensions per level: {slide.level_dimensions}")
+
+    chosen_level = min(level, num_levels - 1)
+    w, h = slide.level_dimensions[chosen_level]
+    while max(w, h) > SVS_MAX_DIM and chosen_level < num_levels - 1:
+        chosen_level += 1
+        w, h = slide.level_dimensions[chosen_level]
+        print(f"  Image too large; stepping up to level {chosen_level} ({w}x{h})")
+
+    if chosen_level != level:
+        print(f"  [INFO] Requested level {level} -> using level {chosen_level} ({w}x{h})")
+    else:
+        print(f"  Reading level {chosen_level}: {w}x{h} px")
+
+    TILE = 4096
+    bgr_out = np.empty((h, w, 3), dtype=np.uint8)
+    scale = slide.level_downsamples[chosen_level]
+
+    total_tiles = ((h + TILE - 1) // TILE) * ((w + TILE - 1) // TILE)
+    tile_idx = 0
+
+    for y in range(0, h, TILE):
+        for x in range(0, w, TILE):
+            tw = min(TILE, w - x)
+            th = min(TILE, h - y)
+
+            x0 = int(x * scale)
+            y0 = int(y * scale)
+
+            region = slide.read_region((x0, y0), chosen_level, (tw, th))
+            rgba = np.array(region, dtype=np.uint8)
+            bgr_out[y:y + th, x:x + tw] = rgba[:, :, 2::-1]
+
+            tile_idx += 1
+            if tile_idx % 50 == 0 or tile_idx == total_tiles:
+                print(f"  ... tile {tile_idx}/{total_tiles}", end="\r")
+
+    print()
+    slide.close()
+    return _ensure_bgr_u8(bgr_out)
 
 
 def run_pipeline(
@@ -168,11 +270,17 @@ def run_pipeline(
     normalize: str = "0_1",
     svs_root: Optional[str] = None,
     svs_level: int = 0,
+    export_train_pairs: bool = False,
+    targets_root: Optional[str] = None,
+    train_raw_out: str = "train_pairs/raw",
+    train_he_out: str = "train_pairs/he",
+    patches_per_slide: int = 200,
+    patch_size: int = 256,
+    patch_seed: int = 1337,
 ) -> None:
     ensure_dir(stitched_out)
     ensure_dir(final_out)
 
-    # Your exact defaults + NEW brightness lift
     hsb_params = {
         "chunk_width": 1024,
         "do_hue": True,
@@ -205,17 +313,12 @@ def run_pipeline(
         "white_hue_center": 140,
         "white_hue_strength": 0.22,
 
-        # NEW: brighten everything a bit
-        "v_offset_all": 45,  # try 10..30
+        "v_offset_all": 45,
     }
 
     def _apply_method(bgr: np.ndarray, meta_in: dict):
         if method == "hsv":
-            bgr_adj, meta = hsb_adjust.adjust_bgr_image_hsb(
-                bgr,
-                params=hsb_params,
-                metadata=meta_in,
-            )
+            bgr_adj, meta = hsb_adjust.adjust_bgr_image_hsb(bgr, params=hsb_params, metadata=meta_in)
             return _ensure_bgr_u8(bgr_adj), meta
 
         if method == "ml":
@@ -235,9 +338,93 @@ def run_pipeline(
 
         raise ValueError(f"Unknown method: {method}")
 
-    # ------------------------------------------------------------------ #
-    #  SVS mode                                                            #
-    # ------------------------------------------------------------------ #
+    # ---------------- Export training pairs ----------------
+    if export_train_pairs:
+        if raw_root is None:
+            raise ValueError("--export-train-pairs requires --raw-root (folders of tiles)")
+        if not targets_root:
+            raise ValueError("--export-train-pairs requires --targets-root")
+
+        ensure_dir(train_raw_out)
+        ensure_dir(train_he_out)
+
+        folders = list_subfolders(raw_root)
+        if not folders:
+            print(f"No subfolders found under: {raw_root}")
+            return
+
+        print(f"Exporting training pairs from {len(folders)} raw folders...")
+        failed = []
+
+        for idx, folder in enumerate(folders, 1):
+            name = folder.name
+
+            tif_path = Path(targets_root) / f"{name}.tif"
+            if not tif_path.exists():
+                tif_path = Path(targets_root) / f"{name}.tiff"
+
+            if not tif_path.exists():
+                print(f"[{idx}/{len(folders)}] [WARN] No target tif for {name}; skipping.")
+                failed.append((name, "missing target tif"))
+                continue
+
+            print(f"\n[{idx}/{len(folders)}] Exporting pairs for: {name}")
+
+            try:
+                raw_bgr = stitch.stitch_folder_to_image(str(folder), num_rows=num_rows)
+                raw_bgr = _ensure_bgr_u8(raw_bgr)
+                print(f"  stitched raw -> shape={raw_bgr.shape} dtype={raw_bgr.dtype}")
+            except Exception as e:
+                print(f"  [ERROR] Stitch failed for {name}: {e}")
+                failed.append((name, f"stitch failed: {e}"))
+                continue
+
+            try:
+                tgt_bgr = _read_tif(tif_path)
+                tgt_bgr = _ensure_bgr_u8(tgt_bgr)
+                print(f"  read target -> shape={tgt_bgr.shape} dtype={tgt_bgr.dtype}")
+            except Exception as e:
+                print(f"  [ERROR] Read target TIF failed for {name}: {e}")
+                failed.append((name, f"target read failed: {e}"))
+                continue
+
+            if raw_bgr.shape[:2] != tgt_bgr.shape[:2]:
+                msg = f"size mismatch raw={raw_bgr.shape[:2]} tgt={tgt_bgr.shape[:2]}"
+                print(f"  [ERROR] {msg}")
+                failed.append((name, msg))
+                continue
+
+            try:
+                pairs = _sample_paired_patches(
+                    raw_bgr=raw_bgr,
+                    tgt_bgr=tgt_bgr,
+                    patch=patch_size,
+                    count=patches_per_slide,
+                    seed=patch_seed,
+                )
+            except Exception as e:
+                print(f"  [ERROR] Patch sampling failed for {name}: {e}")
+                failed.append((name, f"patch sampling failed: {e}"))
+                continue
+
+            for j, (rp, tp, (x0, y0)) in enumerate(pairs):
+                stem = f"{name}__{j:06d}_x{x0:08d}_y{y0:08d}.png"
+                raw_out = Path(train_raw_out) / stem
+                he_out = Path(train_he_out) / stem
+                cv2.imwrite(str(raw_out), rp)
+                cv2.imwrite(str(he_out), tp)
+
+            print(f"  wrote {len(pairs)} patch pairs")
+
+        if failed:
+            print("\nFAILED:")
+            for n, r in failed:
+                print(f"  {n}: {r}")
+        else:
+            print("\nAll slides exported successfully.")
+        return
+
+    # ---------------- SVS mode ----------------
     if svs_root:
         svs_paths = list_svs(svs_root)
         if not svs_paths:
@@ -245,6 +432,7 @@ def run_pipeline(
             return
 
         print(f"Found {len(svs_paths)} SVS files under: {svs_root}")
+        failed = []
 
         for idx, svs_path in enumerate(svs_paths, 1):
             name = svs_path.stem
@@ -257,27 +445,44 @@ def run_pipeline(
 
             print(f"\n[{idx}/{len(svs_paths)}] Processing SVS: {svs_path.name}")
 
-            bgr = _read_svs(svs_path, level=svs_level)
-            print(f"  read SVS -> shape={bgr.shape} dtype={bgr.dtype} level={svs_level}")
+            try:
+                bgr = _read_svs(svs_path, level=svs_level)
+                print(f"  read SVS -> shape={bgr.shape} dtype={bgr.dtype}")
+            except Exception as e:
+                print(f"  [ERROR] Could not read SVS, skipping: {svs_path.name}")
+                print(f"          Reason: {e}")
+                failed.append((svs_path.name, f"read error: {e}"))
+                continue
 
-            bgr_adj, meta = _apply_method(bgr, {"source_svs": str(svs_path), "method": method})
+            try:
+                bgr_adj, meta = _apply_method(bgr, {"source_svs": str(svs_path), "method": method})
+            except Exception as e:
+                print(f"  [ERROR] Adjustment failed, skipping: {svs_path.name}")
+                print(f"          Reason: {e}")
+                failed.append((svs_path.name, f"adjustment error: {e}"))
+                continue
 
-            if method == "hsv":
-                print(f"  adjust counts: {meta.get('counts')}")
-                print(f"  version: {meta.get('version')}")
-            else:
-                print(f"  ml meta: {meta}")
+            try:
+                written_path, written_fmt = save_final_image_with_fallback(final_jpg_path, bgr_adj, quality=JPEG_QUALITY)
+                print(f"  saved -> {written_path}  ({written_fmt})")
+            except Exception as e:
+                print(f"  [ERROR] Could not save output, skipping: {svs_path.name}")
+                print(f"          Reason: {e}")
+                failed.append((svs_path.name, f"save error: {e}"))
+                continue
 
-            written_path, written_fmt = save_final_image_with_fallback(
-                final_jpg_path, bgr_adj, quality=JPEG_QUALITY
-            )
-            print(f"  saved -> {written_path}  ({written_fmt})")
-
+        if failed:
+            print(f"\n{'=' * 60}")
+            print(f"FAILED FILES ({len(failed)}):")
+            for fname, reason in failed:
+                print(f"  {fname}")
+                print(f"    {reason}")
+            print(f"{'=' * 60}")
+        else:
+            print(f"\nAll {len(svs_paths)} files processed successfully.")
         return
 
-    # ------------------------------------------------------------------ #
-    #  Skip-stitch mode (already-stitched BMPs)                           #
-    # ------------------------------------------------------------------ #
+    # ---------------- Skip-stitch mode ----------------
     if skip_stitch:
         if not stitched_root:
             raise ValueError("--skip-stitch requires --stitched-root")
@@ -300,37 +505,23 @@ def run_pipeline(
                     continue
 
             print(f"\n[{idx}/{len(bmp_paths)}] Processing stitched BMP: {bmp_path.name}")
-
             bgr = _read_bmp(bmp_path)
 
             try:
                 save_bmp(stitched_bmp_path, bgr)
                 print(f"  stitched (input) -> {stitched_bmp_path}  shape={bgr.shape} dtype={bgr.dtype}")
             except Exception as e:
-                print(f"  [WARN] Could not write stitched BMP (skipping): {stitched_bmp_path}")
-                print(f"         Reason: {e}")
-                print(f"  stitched -> (not saved)  shape={bgr.shape} dtype={bgr.dtype}")
+                print(f"  [WARN] Could not write stitched BMP: {e}")
 
             bgr_adj, meta = _apply_method(bgr, {"source_bmp": str(bmp_path), "method": method})
-
-            if method == "hsv":
-                print(f"  adjust counts: {meta.get('counts')}")
-                print(f"  version: {meta.get('version')}")
-            else:
-                print(f"  ml meta: {meta}")
-
-            written_path, written_fmt = save_final_image_with_fallback(
-                final_jpg_path, bgr_adj, quality=JPEG_QUALITY
-            )
-            print(f"  saved -> {written_path}  ({written_fmt}, quality={JPEG_QUALITY})")
+            written_path, written_fmt = save_final_image_with_fallback(final_jpg_path, bgr_adj, quality=JPEG_QUALITY)
+            print(f"  saved -> {written_path}  ({written_fmt})")
 
         return
 
-    # ------------------------------------------------------------------ #
-    #  Normal stitch mode (raw tile subfolders)                           #
-    # ------------------------------------------------------------------ #
+    # ---------------- Normal stitch mode ----------------
     if raw_root is None:
-        raise ValueError("raw_root is required unless --skip-stitch or --svs-root is used")
+        raise ValueError("raw_root is required unless --skip-stitch or --svs-root or --export-train-pairs is used")
 
     folders = list_subfolders(raw_root)
     if not folders:
@@ -358,26 +549,17 @@ def run_pipeline(
             save_bmp(stitched_bmp_path, bgr)
             print(f"  stitched -> {stitched_bmp_path}  shape={bgr.shape} dtype={bgr.dtype}")
         except Exception as e:
-            print(f"  [WARN] Could not write stitched BMP (skipping): {stitched_bmp_path}")
-            print(f"         Reason: {e}")
-            print(f"  stitched -> (not saved)  shape={bgr.shape} dtype={bgr.dtype}")
+            print(f"  [WARN] Could not write stitched BMP: {e}")
 
         bgr_adj, meta = _apply_method(bgr, {"source_folder": name, "method": method})
-
-        if method == "hsv":
-            print(f"  adjust counts: {meta.get('counts')}")
-            print(f"  version: {meta.get('version')}")
-        else:
-            print(f"  ml meta: {meta}")
-
-        written_path, written_fmt = save_final_image_with_fallback(
-            final_jpg_path, bgr_adj, quality=JPEG_QUALITY
-        )
-        print(f"  saved -> {written_path}  ({written_fmt}, quality={JPEG_QUALITY})")
+        written_path, written_fmt = save_final_image_with_fallback(final_jpg_path, bgr_adj, quality=JPEG_QUALITY)
+        print(f"  saved -> {written_path}  ({written_fmt})")
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Stitching + HSB adjustment pipeline (supports stitched BMP mode and SVS mode)")
+    ap = argparse.ArgumentParser(
+        description="Stitching + adjustment pipeline (supports stitched BMP, SVS, raw tile modes, and exporting train pairs)"
+    )
 
     ap.add_argument("--raw-root", help="Folder containing raw tile subfolders (stitch mode)")
     ap.add_argument("--stitched-out", default="stitched_bmps", help="Where to write stitched BMPs (and/or copies)")
@@ -389,7 +571,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--stitched-root", help="Folder containing stitched .bmp files (required with --skip-stitch)")
 
     ap.add_argument("--svs-root", help="Folder containing .svs files to process directly (no stitching needed)")
-    ap.add_argument("--svs-level", type=int, default=0, help="SVS pyramid level to read (0 = full resolution)")
+    ap.add_argument("--svs-level", type=int, default=0, help="SVS pyramid level (0=full res). Auto-steps up if exceeds SVS_MAX_DIM.")
 
     ap.add_argument("--method", choices=["hsv", "ml"], default="hsv", help="Colorization method")
 
@@ -398,6 +580,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--tile-size", type=int, default=512, help="ML inference tile size")
     ap.add_argument("--overlap", type=int, default=32, help="ML inference overlap")
     ap.add_argument("--normalize", choices=["none", "0_1", "imagenet"], default="0_1", help="ML normalization mode")
+
+    ap.add_argument("--export-train-pairs", action="store_true", help="Export paired patches from raw tile folders + target TIFFs, then exit.")
+    ap.add_argument("--targets-root", default=None, help="Folder containing target .tif/.tiff files matching raw folder names.")
+    ap.add_argument("--train-raw-out", default="train_pairs/raw", help="Output folder for exported raw patches.")
+    ap.add_argument("--train-he-out", default="train_pairs/he", help="Output folder for exported target patches.")
+    ap.add_argument("--patches-per-slide", type=int, default=200, help="How many patch pairs to export per slide.")
+    ap.add_argument("--patch-size", type=int, default=256, help="Patch size for exported training patches.")
+    ap.add_argument("--patch-seed", type=int, default=1337, help="Seed for patch sampling reproducibility.")
 
     return ap.parse_args()
 
@@ -420,6 +610,13 @@ def main() -> None:
         normalize=args.normalize,
         svs_root=args.svs_root,
         svs_level=args.svs_level,
+        export_train_pairs=args.export_train_pairs,
+        targets_root=args.targets_root,
+        train_raw_out=args.train_raw_out,
+        train_he_out=args.train_he_out,
+        patches_per_slide=args.patches_per_slide,
+        patch_size=args.patch_size,
+        patch_seed=args.patch_seed,
     )
 
 

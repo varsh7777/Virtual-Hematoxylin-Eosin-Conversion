@@ -1,6 +1,18 @@
 import torch
 import torch.nn.functional as F
 
+"""
+models package exports.
+
+Expected by train.py:
+  from models import UNetGenerator, MILAttention, PatchDiscriminator
+"""
+
+from .generator import UNetGenerator
+from .mil import MILAttention
+from .gan import PatchDiscriminator
+
+__all__ = ["UNetGenerator", "MILAttention", "PatchDiscriminator"]
 
 @torch.no_grad()
 def psnr(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0) -> float:

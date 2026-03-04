@@ -22,6 +22,8 @@ from losses import PatchL1Loss, GANLoss
 from models import UNetGenerator, MILAttention, PatchDiscriminator
 from utils import set_seed, save_checkpoint
 
+from tqdm import tqdm
+
 
 def _list_files(root: str, exts: List[str]) -> List[str]:
     out = []
@@ -63,6 +65,8 @@ class PairedBagDataset(Dataset):
         raw_path = self.raw_paths[idx]
         name = os.path.basename(raw_path)
         he_path = os.path.join(self.he_dir, name)
+        if not os.path.exists(he_path):
+            raise FileNotFoundError(f"Missing target for {name}: expected {he_path}")
 
         raw = self._read_rgb01(raw_path)
         he = self._read_rgb01(he_path)
@@ -83,6 +87,11 @@ class PairedBagDataset(Dataset):
         y = torch.from_numpy(np.stack(ys, 0)).permute(0, 3, 1, 2)     # [N,3,P,P]
         return {"x": x, "y_he": y, "name": name}
 
+
+def _seed_worker(worker_id: int):
+    # Make numpy RNG different but deterministic per worker
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
 
 def collate_bags(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     # batch size B of dicts with x:[N,3,P,P]
@@ -122,6 +131,7 @@ def main():
         num_workers=int(cfg["data"]["num_workers"]),
         pin_memory=True,
         collate_fn=collate_bags,
+        worker_init_fn=_seed_worker,
     )
 
     G = UNetGenerator(base_channels=int(cfg["model"]["generator"]["base_channels"])).to(device)
@@ -166,7 +176,9 @@ def main():
 
         running = 0.0
 
-        for step, batch in enumerate(dl, 1):
+        pbar = tqdm(dl, desc=f"Epoch {epoch}", leave=False)
+
+        for step, batch in enumerate(pbar, 1):
             x = batch["x"].to(device, non_blocking=True)       # [B,N,3,P,P]
             y = batch["y_he"].to(device, non_blocking=True)    # [B,N,3,P,P]
             B, N, C, P, _ = x.shape
@@ -224,6 +236,8 @@ def main():
 
             if step % int(cfg["train"]["log_every"]) == 0:
                 print(f"epoch {epoch:03d} step {step:05d}/{len(dl)} recon={running/step:.4f}")
+            
+            pbar.set_postfix({"recon": float(loss_recon.detach()),})
 
         avg_recon = running / max(1, len(dl))
 
