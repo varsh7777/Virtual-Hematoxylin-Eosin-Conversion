@@ -1,6 +1,8 @@
 # ml_infer.py
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
 from typing import Dict, Any, Tuple
 
@@ -15,14 +17,27 @@ except Exception:
     nn = None
 
 
+# ---------------------------------------------------------------------
+# Make sure we can import your training package at:
+#   HPL/ml/mil+attention/models
+# even when pipeline.py is executed from HPL root.
+# ---------------------------------------------------------------------
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_MIL_ROOT = os.path.join(_THIS_DIR, "ml", "mil+attention")  # contains models/, utils/, etc.
+
+if _MIL_ROOT not in sys.path:
+    sys.path.insert(0, _MIL_ROOT)
+
+
 @dataclass
 class MLParams:
     checkpoint: str
-    device: str = "cuda"
+    device: str = "cuda"        # "cuda" or "cpu"
     tile_size: int = 512
     overlap: int = 32
     use_amp: bool = True
-    normalize: str = "0_1"
+    normalize: str = "0_1"      # "none" | "0_1" | "imagenet"
+    base_channels: int = 32     # must match training config
 
 
 def _normalize_rgb(rgb_f32_0_1: np.ndarray, mode: str) -> np.ndarray:
@@ -57,6 +72,7 @@ def _tile_coords(H: int, W: int, tile: int, overlap: int):
 
 
 def _make_weight_mask(tile: int) -> np.ndarray:
+    # Smooth cosine blending mask [tile,tile,1]
     yy = np.linspace(0, 1, tile, dtype=np.float32)
     xx = np.linspace(0, 1, tile, dtype=np.float32)
     wy = 0.5 - 0.5 * np.cos(np.clip(yy, 0, 1) * np.pi)
@@ -65,34 +81,25 @@ def _make_weight_mask(tile: int) -> np.ndarray:
     return w[..., None]
 
 
-def _load_model_from_checkpoint(checkpoint_path: str, device: "torch.device") -> "nn.Module":
+def _load_model_from_checkpoint(checkpoint_path: str, device: "torch.device", base_channels: int) -> "nn.Module":
     """
-    Supports checkpoints saved as:
-      - {"G": state_dict}
-      - {"model": state_dict}
-      - state_dict directly
+    Expects checkpoints saved by your train.py like:
+      torch.save({"G": G.state_dict(), "MIL": MIL.state_dict()}, "best.pt")
 
-    Replace Identity with your real generator when ready.
+    Loads G only for inference.
     """
-    class Identity(nn.Module):
-        def forward(self, x):
-            return x
+    from models import UNetGenerator  # imported from ml/mil+attention/models
 
-    model = Identity().to(device).eval()
+    model = UNetGenerator(base_channels=base_channels).to(device).eval()
 
     ckpt = torch.load(checkpoint_path, map_location=device)
-
-    if isinstance(ckpt, dict):
-        if "G" in ckpt:
-            state = ckpt["G"]
-        elif "model" in ckpt:
-            state = ckpt["model"]
-        else:
-            state = ckpt
+    if isinstance(ckpt, dict) and "G" in ckpt:
+        state_g = ckpt["G"]
     else:
-        state = ckpt
+        # fallback: checkpoint itself is a state_dict
+        state_g = ckpt
 
-    model.load_state_dict(state, strict=False)
+    model.load_state_dict(state_g, strict=True)
     return model
 
 
@@ -115,7 +122,7 @@ def apply_bgr_ml(bgr_u8: np.ndarray, params: MLParams) -> Tuple[np.ndarray, Dict
     device = torch.device(params.device if (params.device == "cpu" or torch.cuda.is_available()) else "cpu")
     use_amp = bool(params.use_amp and device.type == "cuda")
 
-    model = _load_model_from_checkpoint(params.checkpoint, device)
+    model = _load_model_from_checkpoint(params.checkpoint, device, base_channels=int(params.base_channels))
 
     H, W = bgr_u8.shape[:2]
     tile = int(params.tile_size)
@@ -132,7 +139,7 @@ def apply_bgr_ml(bgr_u8: np.ndarray, params: MLParams) -> Tuple[np.ndarray, Dict
 
     for y0 in ys:
         for x0 in xs:
-            patch = rgb_n[y0:y0 + tile, x0:x0 + tile, :]
+            patch = rgb_n[y0:y0 + tile, x0:x0 + tile, :]  # [tile,tile,3]
             t = torch.from_numpy(patch).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
 
             if use_amp:
@@ -141,7 +148,10 @@ def apply_bgr_ml(bgr_u8: np.ndarray, params: MLParams) -> Tuple[np.ndarray, Dict
             else:
                 y = model(t)
 
-            y = y[0].permute(1, 2, 0).detach().cpu().numpy().astype(np.float32)
+            # assume model outputs in [0,1]. If your generator uses tanh, uncomment:
+            # y = (y + 1.0) / 2.0
+
+            y = y[0].permute(1, 2, 0).detach().cpu().numpy().astype(np.float32)  # [tile,tile,3]
             y = _denormalize_rgb(y, params.normalize)
             y = np.clip(y, 0.0, 1.0)
 
@@ -160,6 +170,7 @@ def apply_bgr_ml(bgr_u8: np.ndarray, params: MLParams) -> Tuple[np.ndarray, Dict
         "overlap": overlap,
         "normalize": params.normalize,
         "use_amp": use_amp,
+        "base_channels": int(params.base_channels),
         "shape_in": (int(H), int(W)),
     }
     return out_bgr, meta
