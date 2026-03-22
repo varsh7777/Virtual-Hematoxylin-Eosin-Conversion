@@ -6,7 +6,7 @@ import os
 import glob
 import argparse
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 
 import cv2
 import numpy as np
@@ -29,7 +29,8 @@ def _list_files(root: str, exts: List[str]) -> List[str]:
     out = []
     for e in exts:
         out.extend(glob.glob(os.path.join(root, f"*{e}")))
-    return sorted(out)
+        out.extend(glob.glob(os.path.join(root, f"*{e.upper()}")))
+    return sorted(set(out))
 
 
 class PairedBagDataset(Dataset):
@@ -46,8 +47,9 @@ class PairedBagDataset(Dataset):
       name: str
     """
     def __init__(self, raw_dir: str, he_dir: str, exts: List[str], patch_size: int, bag_size: int):
-        self.raw_paths = _list_files(raw_dir, exts)
+        self.raw_dir = raw_dir
         self.he_dir = he_dir
+        self.raw_paths = _list_files(raw_dir, exts)
         self.patch = patch_size
         self.N = bag_size
 
@@ -65,6 +67,7 @@ class PairedBagDataset(Dataset):
         raw_path = self.raw_paths[idx]
         name = os.path.basename(raw_path)
         he_path = os.path.join(self.he_dir, name)
+
         if not os.path.exists(he_path):
             raise FileNotFoundError(f"Missing target for {name}: expected {he_path}")
 
@@ -74,27 +77,28 @@ class PairedBagDataset(Dataset):
         H, W = raw.shape[:2]
         p = self.patch
 
-        # sample N random patches
+        if H < p or W < p:
+            raise ValueError(f"Image smaller than patch size: {raw_path} shape=({H},{W}) patch={p}")
+
         xs = []
         ys = []
         for _ in range(self.N):
-            y0 = np.random.randint(0, max(1, H - p + 1))
-            x0 = np.random.randint(0, max(1, W - p + 1))
-            xs.append(raw[y0:y0+p, x0:x0+p, :])
-            ys.append(he[y0:y0+p, x0:x0+p, :])
+            y0 = np.random.randint(0, H - p + 1)
+            x0 = np.random.randint(0, W - p + 1)
+            xs.append(raw[y0:y0 + p, x0:x0 + p, :])
+            ys.append(he[y0:y0 + p, x0:x0 + p, :])
 
-        x = torch.from_numpy(np.stack(xs, 0)).permute(0, 3, 1, 2)     # [N,3,P,P]
-        y = torch.from_numpy(np.stack(ys, 0)).permute(0, 3, 1, 2)     # [N,3,P,P]
+        x = torch.from_numpy(np.stack(xs, 0)).permute(0, 3, 1, 2)  # [N,3,P,P]
+        y = torch.from_numpy(np.stack(ys, 0)).permute(0, 3, 1, 2)  # [N,3,P,P]
         return {"x": x, "y_he": y, "name": name}
 
 
 def _seed_worker(worker_id: int):
-    # Make numpy RNG different but deterministic per worker
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
 
+
 def collate_bags(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # batch size B of dicts with x:[N,3,P,P]
     x = torch.stack([b["x"] for b in batch], dim=0)      # [B,N,3,P,P]
     y = torch.stack([b["y_he"] for b in batch], dim=0)   # [B,N,3,P,P]
     names = [b["name"] for b in batch]
@@ -104,6 +108,7 @@ def collate_bags(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/default.yaml")
+    ap.add_argument("--resume", default=None, help="Path to checkpoint to resume training from")
     args = ap.parse_args()
 
     with open(args.config, "r") as f:
@@ -117,6 +122,10 @@ def main():
     out_dir = Path(cfg["output"]["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    print("raw_dir:", cfg["data"]["raw_dir"])
+    print("he_dir:", cfg["data"]["he_dir"])
+    print("ext:", cfg["data"]["ext"])
+
     ds = PairedBagDataset(
         raw_dir=cfg["data"]["raw_dir"],
         he_dir=cfg["data"]["he_dir"],
@@ -124,6 +133,15 @@ def main():
         patch_size=int(cfg["data"]["patch_size"]),
         bag_size=int(cfg["data"]["bag_size"]),
     )
+
+    if len(ds) == 0:
+        raise RuntimeError(
+            f"No training files found in raw_dir={cfg['data']['raw_dir']} "
+            f"with ext={cfg['data']['ext']}"
+        )
+
+    print("dataset size:", len(ds))
+
     dl = DataLoader(
         ds,
         batch_size=int(cfg["train"]["batch_size"]),
@@ -144,7 +162,11 @@ def main():
     if use_gan:
         D = PatchDiscriminator(base_channels=int(cfg["gan"]["d_base_channels"])).to(device)
         gan_loss = GANLoss(cfg["gan"]["gan_mode"]).to(device)
-        opt_d = optim.AdamW(D.parameters(), lr=float(cfg["train"]["lr"]), betas=(0.5, 0.999))
+        opt_d = optim.AdamW(
+            D.parameters(),
+            lr=float(cfg["train"]["lr"]),
+            betas=(0.5, 0.999),
+        )
     else:
         D = None
         gan_loss = None
@@ -166,9 +188,59 @@ def main():
     lambda_gan = float(cfg["loss"]["lambda_gan"])
     attn_weighted = bool(cfg["loss"]["attention_weighted_recon"])
 
+    start_epoch = 1
     best = 1e9
 
-    for epoch in range(1, int(cfg["train"]["epochs"]) + 1):
+    # ---------------- Resume support ----------------
+    if args.resume is not None:
+        print("Loading checkpoint:", args.resume)
+        ckpt = torch.load(args.resume, map_location=device)
+
+        if not isinstance(ckpt, dict):
+            raise RuntimeError(f"Checkpoint format not supported: {args.resume}")
+
+        if "G" not in ckpt or "MIL" not in ckpt:
+            raise RuntimeError(f"Checkpoint missing required keys 'G' and 'MIL': {args.resume}")
+
+        G.load_state_dict(ckpt["G"], strict=True)
+        MIL.load_state_dict(ckpt["MIL"], strict=True)
+
+        # Resume optimizer/scaler if present
+        if "opt" in ckpt:
+            opt.load_state_dict(ckpt["opt"])
+            print("Loaded optimizer state")
+        else:
+            print("No optimizer state found in checkpoint; starting optimizer fresh")
+
+        if "scaler" in ckpt and bool(cfg["train"]["amp"]):
+            try:
+                scaler.load_state_dict(ckpt["scaler"])
+                print("Loaded AMP scaler state")
+            except Exception as e:
+                print(f"Could not load scaler state: {e}")
+
+        if use_gan and D is not None and "D" in ckpt:
+            D.load_state_dict(ckpt["D"], strict=True)
+            print("Loaded discriminator state")
+
+        if use_gan and opt_d is not None and "opt_d" in ckpt:
+            opt_d.load_state_dict(ckpt["opt_d"])
+            print("Loaded discriminator optimizer state")
+
+        if "epoch" in ckpt:
+            start_epoch = int(ckpt["epoch"]) + 1
+            print("Resuming from epoch", start_epoch)
+        else:
+            print("No epoch stored in checkpoint; resuming weights from epoch 1")
+
+        if "best" in ckpt:
+            best = float(ckpt["best"])
+            print("Loaded best recon:", best)
+        else:
+            print("No best recon stored in checkpoint; resetting best to large value")
+
+    # ---------------- Training loop ----------------
+    for epoch in range(start_epoch, int(cfg["train"]["epochs"]) + 1):
         G.train()
         MIL.train()
         if D is not None:
@@ -183,14 +255,14 @@ def main():
             y = batch["y_he"].to(device, non_blocking=True)    # [B,N,3,P,P]
             B, N, C, P, _ = x.shape
 
-            # ---- forward generator per patch ----
             x_flat = x.view(B * N, C, P, P)
+
             with autocast(enabled=bool(cfg["train"]["amp"])):
                 yhat_flat = G(x_flat)                          # [B*N,3,P,P]
                 yhat = yhat_flat.view(B, N, 3, P, P)
 
-                mil_out = MIL(x)                               # attention over raw patches
-                attn = mil_out["attn"]                         # [B,N]
+                mil_out = MIL(x)                              # attention over raw patches
+                attn = mil_out["attn"]                        # [B,N]
 
                 patch_l1_map, patch_l1_mean = recon_loss(yhat, y)
                 if attn_weighted:
@@ -200,9 +272,7 @@ def main():
 
                 loss_g = lambda_recon * loss_recon
 
-                # ---- optional GAN: generator loss ----
                 if use_gan:
-                    # D expects [B,3,P,P], so use patch batch [B*N,3,P,P]
                     pred_fake = D(yhat_flat)
                     loss_g_gan = gan_loss(pred_fake, True)
                     loss_g = loss_g + lambda_gan * loss_g_gan
@@ -217,7 +287,6 @@ def main():
             scaler.step(opt)
             scaler.update()
 
-            # ---- optional GAN: discriminator step ----
             if use_gan:
                 with torch.no_grad():
                     y_flat = y.view(B * N, 3, P, P)
@@ -236,21 +305,50 @@ def main():
 
             if step % int(cfg["train"]["log_every"]) == 0:
                 print(f"epoch {epoch:03d} step {step:05d}/{len(dl)} recon={running/step:.4f}")
-            
-            pbar.set_postfix({"recon": float(loss_recon.detach()),})
+
+            pbar.set_postfix({"recon": float(loss_recon.detach())})
 
         avg_recon = running / max(1, len(dl))
 
         # save last
         last_path = out_dir / "last.pt"
-        save_checkpoint(str(last_path), {"G": G.state_dict(), "MIL": MIL.state_dict()})
+        last_payload = {
+            "G": G.state_dict(),
+            "MIL": MIL.state_dict(),
+            "opt": opt.state_dict(),
+            "scaler": scaler.state_dict(),
+            "epoch": epoch,
+            "best": best,
+            "config": cfg,
+        }
+        if use_gan and D is not None:
+            last_payload["D"] = D.state_dict()
+        if use_gan and opt_d is not None:
+            last_payload["opt_d"] = opt_d.state_dict()
+
+        save_checkpoint(str(last_path), last_payload)
         print("saved:", last_path)
 
         # save best
         if bool(cfg["output"]["save_best"]) and avg_recon < best:
             best = avg_recon
             best_path = out_dir / "best.pt"
-            save_checkpoint(str(best_path), {"G": G.state_dict(), "MIL": MIL.state_dict()})
+
+            best_payload = {
+                "G": G.state_dict(),
+                "MIL": MIL.state_dict(),
+                "opt": opt.state_dict(),
+                "scaler": scaler.state_dict(),
+                "epoch": epoch,
+                "best": best,
+                "config": cfg,
+            }
+            if use_gan and D is not None:
+                best_payload["D"] = D.state_dict()
+            if use_gan and opt_d is not None:
+                best_payload["opt_d"] = opt_d.state_dict()
+
+            save_checkpoint(str(best_path), best_payload)
             print("saved BEST:", best_path, "recon=", best)
 
 

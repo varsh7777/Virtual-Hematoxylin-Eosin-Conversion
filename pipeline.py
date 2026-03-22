@@ -388,16 +388,31 @@ def run_pipeline(
                 failed.append((name, f"target read failed: {e}"))
                 continue
 
-            if raw_bgr.shape[:2] != tgt_bgr.shape[:2]:
-                msg = f"size mismatch raw={raw_bgr.shape[:2]} tgt={tgt_bgr.shape[:2]}"
+            Hr, Wr = raw_bgr.shape[:2]
+            Ht, Wt = tgt_bgr.shape[:2]
+
+            H = min(Hr, Ht)
+            W = min(Wr, Wt)
+
+            if H < patch_size or W < patch_size:
+                msg = (
+                    f"overlap too small for patch_size={patch_size}: "
+                    f"overlap=({H},{W}) raw=({Hr},{Wr}) tgt=({Ht},{Wt})"
+                )
                 print(f"  [ERROR] {msg}")
                 failed.append((name, msg))
                 continue
 
+            if (Hr, Wr) != (Ht, Wt):
+                print(f"  [WARN] size mismatch raw=({Hr},{Wr}) tgt=({Ht},{Wt}) -> using overlap crop=({H},{W})")
+
+            raw_use = raw_bgr[:H, :W, :]
+            tgt_use = tgt_bgr[:H, :W, :]
+
             try:
                 pairs = _sample_paired_patches(
-                    raw_bgr=raw_bgr,
-                    tgt_bgr=tgt_bgr,
+                    raw_bgr=raw_use,
+                    tgt_bgr=tgt_use,
                     patch=patch_size,
                     count=patches_per_slide,
                     seed=patch_seed,
