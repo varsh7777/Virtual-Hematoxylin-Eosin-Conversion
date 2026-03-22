@@ -332,6 +332,8 @@ def run_pipeline(
                 overlap=overlap,
                 use_amp=True,
                 normalize=normalize,
+                base_channels=32,          # match training config
+                output_activation="sigmoid"  # use "tanh" only if your generator ends with Tanh
             )
             bgr_adj, meta = apply_bgr_ml(bgr, ml_params)
             return _ensure_bgr_u8(bgr_adj), meta

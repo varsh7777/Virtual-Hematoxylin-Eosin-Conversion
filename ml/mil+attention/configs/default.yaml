@@ -28,6 +28,7 @@ train:
 loss:
   lambda_recon: 1.0
   lambda_gan: 0.0
+  lambda_perc: 0.05
   attention_weighted_recon: true
 
 gan:

@@ -18,7 +18,7 @@ import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
 
-from losses import PatchL1Loss, GANLoss
+from losses import PatchL1Loss, GANLoss, VGGPerceptualLoss
 from models import UNetGenerator, MILAttention, PatchDiscriminator
 from utils import set_seed, save_checkpoint
 
@@ -174,6 +174,13 @@ def main():
 
     recon_loss = PatchL1Loss().to(device)
 
+    perc_loss = VGGPerceptualLoss(
+        layer_ids=(3, 8, 15, 22),
+        layer_weights=(1.0, 1.0, 1.0, 1.0),
+        resize=None,   # keep patch size as-is
+        use_l1=True,
+    ).to(device)
+
     params = list(G.parameters()) + list(MIL.parameters())
     opt = optim.AdamW(
         params,
@@ -186,6 +193,7 @@ def main():
 
     lambda_recon = float(cfg["loss"]["lambda_recon"])
     lambda_gan = float(cfg["loss"]["lambda_gan"])
+    lambda_perc = float(cfg["loss"].get("lambda_perc", 0.0))
     attn_weighted = bool(cfg["loss"]["attention_weighted_recon"])
 
     start_epoch = 1
@@ -270,7 +278,13 @@ def main():
                 else:
                     loss_recon = patch_l1_mean
 
-                loss_g = lambda_recon * loss_recon
+                # Perceptual loss is computed on flattened patch batches: [B*N,3,P,P]
+                if lambda_perc > 0.0:
+                    loss_perc = perc_loss(yhat_flat, y.view(B * N, 3, P, P))
+                else:
+                    loss_perc = torch.tensor(0.0, device=device)
+
+                loss_g = lambda_recon * loss_recon + lambda_perc * loss_perc
 
                 if use_gan:
                     pred_fake = D(yhat_flat)
@@ -304,9 +318,18 @@ def main():
             running += float(loss_recon.detach())
 
             if step % int(cfg["train"]["log_every"]) == 0:
-                print(f"epoch {epoch:03d} step {step:05d}/{len(dl)} recon={running/step:.4f}")
+                if lambda_perc > 0.0:
+                    print(
+                        f"epoch {epoch:03d} step {step:05d}/{len(dl)} "
+                        f"recon={running/step:.4f} perc={float(loss_perc.detach()):.4f}"
+                    )
+                else:
+                    print(f"epoch {epoch:03d} step {step:05d}/{len(dl)} recon={running/step:.4f}")
 
-            pbar.set_postfix({"recon": float(loss_recon.detach())})
+            postfix = {"recon": float(loss_recon.detach())}
+            if lambda_perc > 0.0:
+                postfix["perc"] = float(loss_perc.detach())
+            pbar.set_postfix(postfix)
 
         avg_recon = running / max(1, len(dl))
 
