@@ -14,6 +14,7 @@ import warnings
 import stitch
 from hsv import hsb_adjust
 from ml_infer import MLParams, apply_bgr_ml
+from bb_infer import BBParams, apply_bgr_bb
 
 JPEG_QUALITY = 98
 SVS_MAX_DIM = 30000
@@ -337,6 +338,25 @@ def run_pipeline(
             )
             bgr_adj, meta = apply_bgr_ml(bgr, ml_params)
             return _ensure_bgr_u8(bgr_adj), meta
+        
+        if method == "bb":
+            if not checkpoint:
+                raise ValueError("--checkpoint is required when --method bb")
+
+            bb_params = BBParams(
+                checkpoint=checkpoint,
+                device=device,
+                tile_size=tile_size,
+                overlap=overlap,
+                base_channels=32,   # match training
+                time_dim=128,       # match training
+                num_steps=20,       # start smaller for whole-slide speed
+                sigma_min=1e-4,
+                sigma_max=0.05,
+                eta=0.0,
+            )
+            bgr_adj, meta = apply_bgr_bb(bgr, bb_params)
+            return _ensure_bgr_u8(bgr_adj), meta
 
         raise ValueError(f"Unknown method: {method}")
 
@@ -590,8 +610,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--svs-root", help="Folder containing .svs files to process directly (no stitching needed)")
     ap.add_argument("--svs-level", type=int, default=0, help="SVS pyramid level (0=full res). Auto-steps up if exceeds SVS_MAX_DIM.")
 
-    ap.add_argument("--method", choices=["hsv", "ml"], default="hsv", help="Colorization method")
-
+    ap.add_argument("--method", choices=["hsv", "ml", "bb"], default="hsv", help="Colorization method")
     ap.add_argument("--checkpoint", default=None, help="Path to PyTorch checkpoint for ML method (.pt)")
     ap.add_argument("--device", default="cuda", help="cuda or cpu")
     ap.add_argument("--tile-size", type=int, default=512, help="ML inference tile size")
