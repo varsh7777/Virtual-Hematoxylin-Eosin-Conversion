@@ -1,0 +1,37 @@
+seed: 1337
+
+data:
+  raw_dir: "C:/Users/sriva/Downloads/train_pairs/raw"
+  he_dir: "C:/Users/sriva/Downloads/train_pairs/he"
+  ext: [".png"]
+  patch_size: 256
+  num_workers: 4
+
+train:
+  epochs: 50
+  batch_size: 8
+  lr: 0.0002
+  weight_decay: 0.0001
+  amp: true
+  grad_clip: 1.0
+  log_every: 25
+
+model:
+  base_channels: 32
+  time_dim: 128
+
+diffusion:
+  num_steps: 50
+  sigma_min: 0.0001
+  sigma_max: 0.05
+  sample_steps: 50
+  sample_eta: 0.0
+
+loss:
+  lambda_eps: 1.0
+  lambda_x0: 0.1
+  use_l1_for_x0: true
+
+output:
+  out_dir: "C:/Users/sriva/Downloads/runs/bb_diffusion"
+  save_best: true
