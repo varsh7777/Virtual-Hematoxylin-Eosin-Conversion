@@ -22,5 +22,7 @@ def save_color_histogram_png(image_path, out_path="hist.png", h=400, w=512):
     cv2.imwrite(out_path, canvas)
     print("Saved:", out_path)
 
-save_color_histogram_png("C:/Users/sriva/Downloads/2_curve_snr1.6_level16.png",
-                         "C:/Users/sriva/Downloads/opt_hist.png")
+save_color_histogram_png("C:/Users/sriva/Downloads/2025-11-28_08-46_P0077 l1 loss, 6 epochs.png",
+                         "C:/Users/sriva/Downloads/p77 mil hist.png")
+
+# "C:\Users\sriva\Downloads\2025-11-28_08-46_P0077.bmp"
