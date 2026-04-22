@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Sequence, Tuple, Optional
+from typing import List, Sequence, Tuple, Optional, Dict
+import csv
 import math
 import random
 
 import cv2
 import numpy as np
-from PIL import Image
 import tifffile
 import torch
 import torch.nn as nn
@@ -59,6 +59,15 @@ class SlidePair:
         return raw_rgb, tgt_rgb
 
 
+@dataclass(frozen=True)
+class TileRecord:
+    slide_name: str
+    x: int
+    y: int
+    tile_size: int
+    split: str  # "train" or "val"
+
+
 def _read_image_rgb(path: Path) -> np.ndarray:
     suffix = path.suffix.lower()
 
@@ -82,7 +91,6 @@ def _read_image_rgb(path: Path) -> np.ndarray:
 
         return np.ascontiguousarray(arr)
 
-    # fallback for png/jpg/etc
     bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if bgr is None:
         raise RuntimeError(f"Failed to read image: {path}")
@@ -130,123 +138,142 @@ def _apply_basic_aug(
     return raw_rgb, tgt_rgb
 
 
-class RandomPairedWSIDataset(Dataset):
-    def __init__(
-        self,
-        slide_pairs: Sequence[SlidePair],
-        tile_size: int,
-        tiles_per_epoch: int,
-        white_mean_thresh: float = 245.0,
-        low_std_thresh: float = 5.0,
-        max_retries: int = 50,
-        augment: bool = True,
-        seed: int = 0,
-    ) -> None:
-        self.slide_pairs = list(slide_pairs)
-        self.tile_size = int(tile_size)
-        self.tiles_per_epoch = int(tiles_per_epoch)
-        self.white_mean_thresh = float(white_mean_thresh)
-        self.low_std_thresh = float(low_std_thresh)
-        self.max_retries = int(max_retries)
-        self.augment = bool(augment)
-        self.seed = int(seed)
-
-        for p in self.slide_pairs:
-            if p.width < self.tile_size or p.height < self.tile_size:
-                raise ValueError(
-                    f"Slide pair {p.name} is smaller than tile size {self.tile_size}: "
-                    f"{p.width}x{p.height}"
-                )
-
-    def __len__(self) -> int:
-        return self.tiles_per_epoch
-
-    def __getitem__(self, idx: int):
-        worker_seed = torch.initial_seed() % (2**32)
-        rng = random.Random(self.seed + idx + worker_seed)
-
-        for _ in range(self.max_retries):
-            pair = rng.choice(self.slide_pairs)
-            max_x = pair.width - self.tile_size
-            max_y = pair.height - self.tile_size
-            x = rng.randint(0, max_x)
-            y = rng.randint(0, max_y)
-
-            raw_rgb, tgt_rgb = pair.read_pair(x, y, self.tile_size)
-
-            if not _tile_is_valid(raw_rgb, self.white_mean_thresh, self.low_std_thresh):
-                continue
-            if not _tile_is_valid(tgt_rgb, self.white_mean_thresh, self.low_std_thresh):
-                continue
-
-            if self.augment:
-                raw_rgb, tgt_rgb = _apply_basic_aug(raw_rgb, tgt_rgb, rng)
-
-            return {
-                "input": _to_tensor(raw_rgb),
-                "target": _to_tensor(tgt_rgb),
-                "slide_name": pair.name,
-                "xy": (x, y),
-            }
-
-        pair = rng.choice(self.slide_pairs)
-        x = max(0, (pair.width - self.tile_size) // 2)
-        y = max(0, (pair.height - self.tile_size) // 2)
-        raw_rgb, tgt_rgb = pair.read_pair(x, y, self.tile_size)
-        return {
-            "input": _to_tensor(raw_rgb),
-            "target": _to_tensor(tgt_rgb),
-            "slide_name": pair.name,
-            "xy": (x, y),
-        }
+def _write_tile_csv(path: Path, rows: Sequence[TileRecord], epoch: Optional[int] = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["epoch", "slide_name", "x", "y", "tile_size", "split"],
+        )
+        writer.writeheader()
+        for r in rows:
+            d = asdict(r)
+            d["epoch"] = epoch
+            writer.writerow(d)
 
 
-class FixedValPairedWSIDataset(Dataset):
-    def __init__(
-        self,
-        slide_pairs: Sequence[SlidePair],
-        tile_size: int,
-        tiles_per_slide: int,
-        white_mean_thresh: float = 245.0,
-        low_std_thresh: float = 5.0,
-        max_retries_per_tile: int = 200,
-        seed: int = 1337,
-    ) -> None:
-        self.samples: List[Tuple[SlidePair, int, int]] = []
-        self.tile_size = int(tile_size)
-        rng = random.Random(seed)
+def _build_tile_manifest(
+    slide_pairs: Sequence[SlidePair],
+    tile_size: int,
+    stride: int,
+    white_mean_thresh: float,
+    low_std_thresh: float,
+) -> List[TileRecord]:
+    manifest: List[TileRecord] = []
 
-        for pair in slide_pairs:
-            max_x = pair.width - self.tile_size
-            max_y = pair.height - self.tile_size
-            found = 0
-            tries = 0
-            while found < tiles_per_slide and tries < tiles_per_slide * max_retries_per_tile:
-                tries += 1
-                x = rng.randint(0, max_x)
-                y = rng.randint(0, max_y)
-                raw_rgb, tgt_rgb = pair.read_pair(x, y, self.tile_size)
+    for pair in slide_pairs:
+        if pair.width < tile_size or pair.height < tile_size:
+            raise ValueError(
+                f"Slide pair {pair.name} is smaller than tile size {tile_size}: "
+                f"{pair.width}x{pair.height}"
+            )
+
+        for y in range(0, pair.height - tile_size + 1, stride):
+            for x in range(0, pair.width - tile_size + 1, stride):
+                raw_rgb, tgt_rgb = pair.read_pair(x, y, tile_size)
+
                 if not _tile_is_valid(raw_rgb, white_mean_thresh, low_std_thresh):
                     continue
                 if not _tile_is_valid(tgt_rgb, white_mean_thresh, low_std_thresh):
                     continue
-                self.samples.append((pair, x, y))
-                found += 1
 
-            if found == 0:
-                raise RuntimeError(f"Could not sample any validation tiles from slide {pair.name}")
+                manifest.append(
+                    TileRecord(
+                        slide_name=pair.name,
+                        x=x,
+                        y=y,
+                        tile_size=tile_size,
+                        split="train",  # temporary; reassigned later
+                    )
+                )
+
+    if not manifest:
+        raise RuntimeError("No valid tiles were found while building the manifest.")
+
+    return manifest
+
+
+def _split_manifest(
+    manifest: Sequence[TileRecord],
+    val_tiles_per_slide: int,
+    seed: int,
+) -> Tuple[List[TileRecord], List[TileRecord]]:
+    by_slide: Dict[str, List[TileRecord]] = {}
+    for rec in manifest:
+        by_slide.setdefault(rec.slide_name, []).append(rec)
+
+    rng = random.Random(seed)
+    train_records: List[TileRecord] = []
+    val_records: List[TileRecord] = []
+
+    for slide_name, records in by_slide.items():
+        records = list(records)
+        rng.shuffle(records)
+
+        n_val = min(val_tiles_per_slide, len(records))
+        val_slice = records[:n_val]
+        train_slice = records[n_val:]
+
+        if len(train_slice) == 0:
+            raise RuntimeError(
+                f"After allocating validation tiles, no train tiles remain for slide {slide_name}."
+            )
+
+        val_records.extend(
+            TileRecord(
+                slide_name=r.slide_name,
+                x=r.x,
+                y=r.y,
+                tile_size=r.tile_size,
+                split="val",
+            )
+            for r in val_slice
+        )
+        train_records.extend(
+            TileRecord(
+                slide_name=r.slide_name,
+                x=r.x,
+                y=r.y,
+                tile_size=r.tile_size,
+                split="train",
+            )
+            for r in train_slice
+        )
+
+    return train_records, val_records
+
+
+class TileListDataset(Dataset):
+    def __init__(
+        self,
+        slide_pairs_by_name: Dict[str, SlidePair],
+        records: Sequence[TileRecord],
+        augment: bool = False,
+        seed: int = 0,
+    ) -> None:
+        self.slide_pairs_by_name = slide_pairs_by_name
+        self.records = list(records)
+        self.augment = bool(augment)
+        self.seed = int(seed)
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.records)
 
     def __getitem__(self, idx: int):
-        pair, x, y = self.samples[idx]
-        raw_rgb, tgt_rgb = pair.read_pair(x, y, self.tile_size)
+        rec = self.records[idx]
+        pair = self.slide_pairs_by_name[rec.slide_name]
+        raw_rgb, tgt_rgb = pair.read_pair(rec.x, rec.y, rec.tile_size)
+
+        if self.augment:
+            worker_seed = torch.initial_seed() % (2**32)
+            rng = random.Random(self.seed + idx + worker_seed)
+            raw_rgb, tgt_rgb = _apply_basic_aug(raw_rgb, tgt_rgb, rng)
+
         return {
             "input": _to_tensor(raw_rgb),
             "target": _to_tensor(tgt_rgb),
-            "slide_name": pair.name,
-            "xy": (x, y),
+            "slide_name": rec.slide_name,
+            "xy": (rec.x, rec.y),
         }
 
 
@@ -368,6 +395,44 @@ def _epoch_pass(
     return total_loss / max(total_count, 1)
 
 
+def _take_epoch_records(
+    train_records: List[TileRecord],
+    cursor: int,
+    tiles_per_epoch: int,
+    seed: int,
+    cycle: int,
+) -> Tuple[List[TileRecord], int, int, List[TileRecord]]:
+    """
+    Consume training records without replacement across epochs.
+    When exhausted, reshuffle and start a new cycle.
+    """
+    if len(train_records) == 0:
+        raise RuntimeError("No training records available.")
+
+    selected: List[TileRecord] = []
+    remaining = tiles_per_epoch
+    current_records = train_records
+    current_cursor = cursor
+    current_cycle = cycle
+
+    while remaining > 0:
+        available = len(current_records) - current_cursor
+        if available <= 0:
+            current_cycle += 1
+            reshuffled = list(current_records)
+            random.Random(seed + current_cycle).shuffle(reshuffled)
+            current_records = reshuffled
+            current_cursor = 0
+            available = len(current_records)
+
+        take_n = min(remaining, available)
+        selected.extend(current_records[current_cursor:current_cursor + take_n])
+        current_cursor += take_n
+        remaining -= take_n
+
+    return selected, current_cursor, current_cycle, current_records
+
+
 def train_paired_wsi(
     pairs: Sequence[Tuple[str, str]],
     out_dir: str,
@@ -382,6 +447,7 @@ def train_paired_wsi(
     white_mean_thresh: float = 245.0,
     low_std_thresh: float = 5.0,
     resume_checkpoint: Optional[str] = None,
+    stride: Optional[int] = None,
 ) -> None:
     if len(pairs) == 0:
         raise ValueError("At least one --pair RAW_TIF TARGET_TIF is required.")
@@ -393,27 +459,45 @@ def train_paired_wsi(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    slide_pairs = [SlidePair.open(raw, tgt) for raw, tgt in pairs]
+    stride = tile_size if stride is None else int(stride)
 
-    train_ds = RandomPairedWSIDataset(
+    slide_pairs = [SlidePair.open(raw, tgt) for raw, tgt in pairs]
+    slide_pairs_by_name = {p.name: p for p in slide_pairs}
+
+    print(f"Opening {len(slide_pairs)} paired TIFF slides...")
+    print(f"Tile size: {tile_size}")
+    print(f"Stride: {stride}")
+
+    manifest_all = _build_tile_manifest(
         slide_pairs=slide_pairs,
         tile_size=tile_size,
-        tiles_per_epoch=tiles_per_epoch,
+        stride=stride,
         white_mean_thresh=white_mean_thresh,
         low_std_thresh=low_std_thresh,
-        augment=True,
+    )
+
+    train_records, val_records = _split_manifest(
+        manifest=manifest_all,
+        val_tiles_per_slide=val_tiles_per_slide,
         seed=seed,
     )
-    val_ds = FixedValPairedWSIDataset(
-        slide_pairs=slide_pairs,
-        tile_size=tile_size,
-        tiles_per_slide=val_tiles_per_slide,
-        white_mean_thresh=white_mean_thresh,
-        low_std_thresh=low_std_thresh,
+
+    # Save manifests
+    _write_tile_csv(out_path / "train_manifest.csv", train_records, epoch=None)
+    _write_tile_csv(out_path / "val_manifest.csv", val_records, epoch=None)
+
+    # Shuffle train records once initially
+    train_records_shuffled = list(train_records)
+    random.Random(seed).shuffle(train_records_shuffled)
+    train_cursor = 0
+    train_cycle = 0
+
+    val_ds = TileListDataset(
+        slide_pairs_by_name=slide_pairs_by_name,
+        records=val_records,
+        augment=False,
         seed=seed + 999,
     )
-
-    train_loader = _make_loader(train_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     val_loader = _make_loader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -429,18 +513,49 @@ def train_paired_wsi(
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_val = float(ckpt.get("best_val", math.inf))
+        train_cursor = int(ckpt.get("train_cursor", 0))
+        train_cycle = int(ckpt.get("train_cycle", 0))
+
+        if train_cycle > 0:
+            train_records_shuffled = list(train_records)
+            for c in range(0, train_cycle + 1):
+                random.Random(seed + c).shuffle(train_records_shuffled)
 
     print(f"Training on {len(slide_pairs)} paired slides.")
     print(f"Device: {device}")
-    print(f"Tile size: {tile_size}")
+    print(f"Total valid train tiles: {len(train_records)}")
+    print(f"Total valid val tiles: {len(val_records)}")
     print(f"Tiles per epoch: {tiles_per_epoch}")
     print(f"Validation tiles per slide: {val_tiles_per_slide}")
 
     for epoch in range(start_epoch, epochs + 1):
+        epoch_records, train_cursor, train_cycle, train_records_shuffled = _take_epoch_records(
+            train_records=train_records_shuffled,
+            cursor=train_cursor,
+            tiles_per_epoch=tiles_per_epoch,
+            seed=seed,
+            cycle=train_cycle,
+        )
+
+        # Write exact tiles used this epoch
+        _write_tile_csv(out_path / f"epoch_{epoch:03d}_tiles.csv", epoch_records, epoch=epoch)
+
+        train_ds = TileListDataset(
+            slide_pairs_by_name=slide_pairs_by_name,
+            records=epoch_records,
+            augment=True,
+            seed=seed + epoch,
+        )
+        train_loader = _make_loader(train_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
         train_loss = _epoch_pass(model, train_loader, device, optimizer=optimizer)
         val_loss = _epoch_pass(model, val_loader, device, optimizer=None)
 
-        print(f"Epoch {epoch:03d}/{epochs:03d}  train_l1={train_loss:.6f}  val_l1={val_loss:.6f}")
+        print(
+            f"Epoch {epoch:03d}/{epochs:03d}  "
+            f"train_l1={train_loss:.6f}  val_l1={val_loss:.6f}  "
+            f"cycle={train_cycle}  cursor={train_cursor}/{len(train_records_shuffled)}"
+        )
 
         last_ckpt = out_path / "last.pt"
         torch.save(
@@ -451,6 +566,9 @@ def train_paired_wsi(
                 "best_val": best_val,
                 "pairs": [(str(a), str(b)) for a, b in pairs],
                 "tile_size": tile_size,
+                "stride": stride,
+                "train_cursor": train_cursor,
+                "train_cycle": train_cycle,
             },
             last_ckpt,
         )
@@ -466,6 +584,9 @@ def train_paired_wsi(
                     "best_val": best_val,
                     "pairs": [(str(a), str(b)) for a, b in pairs],
                     "tile_size": tile_size,
+                    "stride": stride,
+                    "train_cursor": train_cursor,
+                    "train_cycle": train_cycle,
                 },
                 best_ckpt,
             )
