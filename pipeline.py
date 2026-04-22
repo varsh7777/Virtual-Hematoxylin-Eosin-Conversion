@@ -1,4 +1,4 @@
-# pipeline.py (Version H++ - export-train-pairs supports huge TIFF targets safely)
+# pipeline.py (Version H+++ - current pipeline + paired TIF training mode)
 # Python 3.8/3.9 compatible
 
 import argparse
@@ -15,6 +15,8 @@ import stitch
 from hsv import hsb_adjust
 from ml_infer import MLParams, apply_bgr_ml
 from bb_infer import BBParams, apply_bgr_bb
+
+from train_paired_wsi import train_paired_wsi
 
 JPEG_QUALITY = 98
 SVS_MAX_DIM = 30000
@@ -137,24 +139,20 @@ def _read_tif(path: Union[str, Path]) -> np.ndarray:
     """
     path = Path(path)
 
-    # 1) tifffile first
     try:
         import tifffile  # type: ignore
         arr = tifffile.imread(str(path))
-        # arr can be HxW, HxWx3, HxWx4, sometimes planar
         if arr.ndim == 2:
             rgb = np.stack([arr, arr, arr], axis=-1)
         elif arr.ndim == 3:
             if arr.shape[2] >= 3:
                 rgb = arr[:, :, :3]
             else:
-                # weird channel layout
                 raise ValueError(f"Unexpected tif array shape: {arr.shape}")
         else:
             raise ValueError(f"Unexpected tif array ndim: {arr.ndim} shape={arr.shape}")
 
         if rgb.dtype != np.uint8:
-            # common TIFF dtypes: uint16; scale down
             if rgb.dtype == np.uint16:
                 rgb = (rgb / 257.0).astype(np.uint8)
             else:
@@ -167,11 +165,10 @@ def _read_tif(path: Union[str, Path]) -> np.ndarray:
     except Exception as e:
         print(f"  [WARN] tifffile failed on {path.name}, falling back to Pillow. Reason: {e}")
 
-    # 2) Pillow fallback (disable decompression-bomb protection for trusted files)
     try:
-        Image.MAX_IMAGE_PIXELS = None  # you trust your local data
+        Image.MAX_IMAGE_PIXELS = None
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore")  # ignore DecompressionBombWarning
+            warnings.simplefilter("ignore")
             with Image.open(str(path)) as im:
                 im = im.convert("RGB")
                 rgb = np.array(im, dtype=np.uint8)
@@ -278,9 +275,35 @@ def run_pipeline(
     patches_per_slide: int = 200,
     patch_size: int = 256,
     patch_seed: int = 1337,
+    task: str = "process",
+    pairs: Optional[List[List[str]]] = None,
+    epochs: int = 20,
+    tiles_per_epoch: int = 1000,
+    val_tiles_per_slide: int = 128,
+    batch_size: int = 8,
+    lr: float = 1e-4,
+    num_workers: int = 0,
+    resume_checkpoint: Optional[str] = None,
 ) -> None:
     ensure_dir(stitched_out)
     ensure_dir(final_out)
+
+    if task == "train_paired_wsi":
+        if not pairs:
+            raise ValueError("At least one --pair RAW_TIF TARGET_TIF must be provided for training.")
+        train_paired_wsi(
+            pairs=[(p[0], p[1]) for p in pairs],
+            out_dir=final_out,
+            epochs=epochs,
+            tiles_per_epoch=tiles_per_epoch,
+            val_tiles_per_slide=val_tiles_per_slide,
+            batch_size=batch_size,
+            tile_size=tile_size,
+            lr=lr,
+            num_workers=num_workers,
+            resume_checkpoint=resume_checkpoint,
+        )
+        return
 
     hsb_params = {
         "chunk_width": 1024,
@@ -333,12 +356,12 @@ def run_pipeline(
                 overlap=overlap,
                 use_amp=True,
                 normalize=normalize,
-                base_channels=32,          # match training config
-                output_activation="sigmoid"  # use "tanh" only if your generator ends with Tanh
+                base_channels=32,
+                output_activation="sigmoid"
             )
             bgr_adj, meta = apply_bgr_ml(bgr, ml_params)
             return _ensure_bgr_u8(bgr_adj), meta
-        
+
         if method == "bb":
             if not checkpoint:
                 raise ValueError("--checkpoint is required when --method bb")
@@ -348,9 +371,9 @@ def run_pipeline(
                 device=device,
                 tile_size=tile_size,
                 overlap=overlap,
-                base_channels=32,   # match training
-                time_dim=128,       # match training
-                num_steps=20,       # start smaller for whole-slide speed
+                base_channels=32,
+                time_dim=128,
+                num_steps=20,
                 sigma_min=1e-4,
                 sigma_max=0.05,
                 eta=0.0,
@@ -432,7 +455,7 @@ def run_pipeline(
             tgt_use = tgt_bgr[:H, :W, :]
 
             try:
-                pairs = _sample_paired_patches(
+                pairs_out = _sample_paired_patches(
                     raw_bgr=raw_use,
                     tgt_bgr=tgt_use,
                     patch=patch_size,
@@ -444,14 +467,14 @@ def run_pipeline(
                 failed.append((name, f"patch sampling failed: {e}"))
                 continue
 
-            for j, (rp, tp, (x0, y0)) in enumerate(pairs):
+            for j, (rp, tp, (x0, y0)) in enumerate(pairs_out):
                 stem = f"{name}__{j:06d}_x{x0:08d}_y{y0:08d}.png"
                 raw_out = Path(train_raw_out) / stem
                 he_out = Path(train_he_out) / stem
                 cv2.imwrite(str(raw_out), rp)
                 cv2.imwrite(str(he_out), tp)
 
-            print(f"  wrote {len(pairs)} patch pairs")
+            print(f"  wrote {len(pairs_out)} patch pairs")
 
         if failed:
             print("\nFAILED:")
@@ -558,7 +581,10 @@ def run_pipeline(
 
     # ---------------- Normal stitch mode ----------------
     if raw_root is None:
-        raise ValueError("raw_root is required unless --skip-stitch or --svs-root or --export-train-pairs is used")
+        raise ValueError(
+            "raw_root is required unless --skip-stitch or --svs-root or "
+            "--export-train-pairs or --task train_paired_wsi is used"
+        )
 
     folders = list_subfolders(raw_root)
     if not folders:
@@ -595,8 +621,10 @@ def run_pipeline(
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Stitching + adjustment pipeline (supports stitched BMP, SVS, raw tile modes, and exporting train pairs)"
+        description="Stitching + adjustment pipeline (supports stitched BMP, SVS, raw tile modes, exporting train pairs, and paired TIFF training)"
     )
+
+    ap.add_argument("--task", choices=["process", "train_paired_wsi"], default="process")
 
     ap.add_argument("--raw-root", help="Folder containing raw tile subfolders (stitch mode)")
     ap.add_argument("--stitched-out", default="stitched_bmps", help="Where to write stitched BMPs (and/or copies)")
@@ -613,7 +641,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--method", choices=["hsv", "ml", "bb"], default="hsv", help="Colorization method")
     ap.add_argument("--checkpoint", default=None, help="Path to PyTorch checkpoint for ML method (.pt)")
     ap.add_argument("--device", default="cuda", help="cuda or cpu")
-    ap.add_argument("--tile-size", type=int, default=512, help="ML inference tile size")
+    ap.add_argument("--tile-size", type=int, default=512, help="ML inference tile size, and training tile size")
     ap.add_argument("--overlap", type=int, default=32, help="ML inference overlap")
     ap.add_argument("--normalize", choices=["none", "0_1", "imagenet"], default="0_1", help="ML normalization mode")
 
@@ -624,6 +652,22 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--patches-per-slide", type=int, default=200, help="How many patch pairs to export per slide.")
     ap.add_argument("--patch-size", type=int, default=256, help="Patch size for exported training patches.")
     ap.add_argument("--patch-seed", type=int, default=1337, help="Seed for patch sampling reproducibility.")
+
+    # Paired TIFF training mode
+    ap.add_argument(
+        "--pair",
+        nargs=2,
+        action="append",
+        metavar=("RAW_TIF", "TARGET_TIF"),
+        help="Paired raw/target TIFF paths. Repeat for multiple slide pairs."
+    )
+    ap.add_argument("--epochs", type=int, default=20, help="Training epochs for --task train_paired_wsi")
+    ap.add_argument("--tiles-per-epoch", type=int, default=1000, help="Random training tiles per epoch")
+    ap.add_argument("--val-tiles-per-slide", type=int, default=128, help="Fixed validation tiles per slide")
+    ap.add_argument("--batch-size", type=int, default=8, help="Training batch size")
+    ap.add_argument("--lr", type=float, default=1e-4, help="Training learning rate")
+    ap.add_argument("--num-workers", type=int, default=0, help="DataLoader workers for training")
+    ap.add_argument("--resume-checkpoint", default=None, help="Resume paired TIFF training from checkpoint")
 
     return ap.parse_args()
 
@@ -653,6 +697,15 @@ def main() -> None:
         patches_per_slide=args.patches_per_slide,
         patch_size=args.patch_size,
         patch_seed=args.patch_seed,
+        task=args.task,
+        pairs=args.pair,
+        epochs=args.epochs,
+        tiles_per_epoch=args.tiles_per_epoch,
+        val_tiles_per_slide=args.val_tiles_per_slide,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        num_workers=args.num_workers,
+        resume_checkpoint=args.resume_checkpoint,
     )
 
 
