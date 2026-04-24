@@ -1,4 +1,4 @@
-# pipeline.py (Version H+++ - current pipeline + paired TIF training mode)
+# pipeline.py (Version H+++ - current pipeline + paired TIFF training mode)
 # Python 3.8/3.9 compatible
 
 import argparse
@@ -284,6 +284,7 @@ def run_pipeline(
     lr: float = 1e-4,
     num_workers: int = 0,
     resume_checkpoint: Optional[str] = None,
+    stride: Optional[int] = None,
 ) -> None:
     ensure_dir(stitched_out)
     ensure_dir(final_out)
@@ -302,6 +303,7 @@ def run_pipeline(
             lr=lr,
             num_workers=num_workers,
             resume_checkpoint=resume_checkpoint,
+            stride=stride,
         )
         return
 
@@ -383,7 +385,6 @@ def run_pipeline(
 
         raise ValueError(f"Unknown method: {method}")
 
-    # ---------------- Export training pairs ----------------
     if export_train_pairs:
         if raw_root is None:
             raise ValueError("--export-train-pairs requires --raw-root (folders of tiles)")
@@ -484,7 +485,6 @@ def run_pipeline(
             print("\nAll slides exported successfully.")
         return
 
-    # ---------------- SVS mode ----------------
     if svs_root:
         svs_paths = list_svs(svs_root)
         if not svs_paths:
@@ -542,7 +542,6 @@ def run_pipeline(
             print(f"\nAll {len(svs_paths)} files processed successfully.")
         return
 
-    # ---------------- Skip-stitch mode ----------------
     if skip_stitch:
         if not stitched_root:
             raise ValueError("--skip-stitch requires --stitched-root")
@@ -579,7 +578,6 @@ def run_pipeline(
 
         return
 
-    # ---------------- Normal stitch mode ----------------
     if raw_root is None:
         raise ValueError(
             "raw_root is required unless --skip-stitch or --svs-root or "
@@ -653,7 +651,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--patch-size", type=int, default=256, help="Patch size for exported training patches.")
     ap.add_argument("--patch-seed", type=int, default=1337, help="Seed for patch sampling reproducibility.")
 
-    # Paired TIFF training mode
     ap.add_argument(
         "--pair",
         nargs=2,
@@ -662,12 +659,13 @@ def parse_args() -> argparse.Namespace:
         help="Paired raw/target TIFF paths. Repeat for multiple slide pairs."
     )
     ap.add_argument("--epochs", type=int, default=20, help="Training epochs for --task train_paired_wsi")
-    ap.add_argument("--tiles-per-epoch", type=int, default=1000, help="Random training tiles per epoch")
-    ap.add_argument("--val-tiles-per-slide", type=int, default=128, help="Fixed validation tiles per slide")
+    ap.add_argument("--tiles-per-epoch", type=int, default=1000, help="Number of training tiles consumed per epoch")
+    ap.add_argument("--val-tiles-per-slide", type=int, default=128, help="Validation tiles reserved per slide")
     ap.add_argument("--batch-size", type=int, default=8, help="Training batch size")
     ap.add_argument("--lr", type=float, default=1e-4, help="Training learning rate")
     ap.add_argument("--num-workers", type=int, default=0, help="DataLoader workers for training")
     ap.add_argument("--resume-checkpoint", default=None, help="Resume paired TIFF training from checkpoint")
+    ap.add_argument("--stride", type=int, default=None, help="Stride for tile manifest generation; defaults to tile-size")
 
     return ap.parse_args()
 
@@ -706,6 +704,7 @@ def main() -> None:
         lr=args.lr,
         num_workers=args.num_workers,
         resume_checkpoint=args.resume_checkpoint,
+        stride=args.stride,
     )
 
 

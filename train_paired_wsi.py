@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
 
 @dataclass
@@ -65,7 +66,7 @@ class TileRecord:
     x: int
     y: int
     tile_size: int
-    split: str  # "train" or "val"
+    split: str
 
 
 def _read_image_rgb(path: Path) -> np.ndarray:
@@ -183,7 +184,7 @@ def _build_tile_manifest(
                         x=x,
                         y=y,
                         tile_size=tile_size,
-                        split="train",  # temporary; reassigned later
+                        split="train",
                     )
                 )
 
@@ -375,7 +376,9 @@ def _epoch_pass(
     total_loss = 0.0
     total_count = 0
 
-    for batch in loader:
+    pbar = tqdm(loader, desc="train" if training else "val", leave=False)
+
+    for batch in pbar:
         x = batch["input"].to(device, non_blocking=True)
         y = batch["target"].to(device, non_blocking=True)
 
@@ -391,6 +394,7 @@ def _epoch_pass(
         bs = x.shape[0]
         total_loss += float(loss.item()) * bs
         total_count += bs
+        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     return total_loss / max(total_count, 1)
 
@@ -402,10 +406,6 @@ def _take_epoch_records(
     seed: int,
     cycle: int,
 ) -> Tuple[List[TileRecord], int, int, List[TileRecord]]:
-    """
-    Consume training records without replacement across epochs.
-    When exhausted, reshuffle and start a new cycle.
-    """
     if len(train_records) == 0:
         raise RuntimeError("No training records available.")
 
@@ -482,11 +482,9 @@ def train_paired_wsi(
         seed=seed,
     )
 
-    # Save manifests
     _write_tile_csv(out_path / "train_manifest.csv", train_records, epoch=None)
     _write_tile_csv(out_path / "val_manifest.csv", val_records, epoch=None)
 
-    # Shuffle train records once initially
     train_records_shuffled = list(train_records)
     random.Random(seed).shuffle(train_records_shuffled)
     train_cursor = 0
@@ -528,7 +526,9 @@ def train_paired_wsi(
     print(f"Tiles per epoch: {tiles_per_epoch}")
     print(f"Validation tiles per slide: {val_tiles_per_slide}")
 
-    for epoch in range(start_epoch, epochs + 1):
+    epoch_pbar = tqdm(range(start_epoch, epochs + 1), desc="epochs")
+
+    for epoch in epoch_pbar:
         epoch_records, train_cursor, train_cycle, train_records_shuffled = _take_epoch_records(
             train_records=train_records_shuffled,
             cursor=train_cursor,
@@ -537,7 +537,6 @@ def train_paired_wsi(
             cycle=train_cycle,
         )
 
-        # Write exact tiles used this epoch
         _write_tile_csv(out_path / f"epoch_{epoch:03d}_tiles.csv", epoch_records, epoch=epoch)
 
         train_ds = TileListDataset(
@@ -550,6 +549,12 @@ def train_paired_wsi(
 
         train_loss = _epoch_pass(model, train_loader, device, optimizer=optimizer)
         val_loss = _epoch_pass(model, val_loader, device, optimizer=None)
+
+        epoch_pbar.set_postfix({
+            "train_l1": f"{train_loss:.4f}",
+            "val_l1": f"{val_loss:.4f}",
+            "cycle": train_cycle,
+        })
 
         print(
             f"Epoch {epoch:03d}/{epochs:03d}  "
