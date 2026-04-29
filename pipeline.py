@@ -296,6 +296,7 @@ def run_pipeline(
     num_workers: int = 0,
     resume_checkpoint: Optional[str] = None,
     stride: Optional[int] = None,
+    perceptual_weight: float = 0.0,
 ) -> None:
     ensure_dir(stitched_out)
     ensure_dir(final_out)
@@ -315,6 +316,7 @@ def run_pipeline(
             num_workers=num_workers,
             resume_checkpoint=resume_checkpoint,
             stride=stride,
+            perceptual_weight=perceptual_weight,
         )
         return
 
@@ -739,6 +741,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--num-workers", type=int, default=0, help="DataLoader workers for training")
     ap.add_argument("--resume-checkpoint", default=None, help="Resume paired TIFF training from checkpoint")
     ap.add_argument("--stride", type=int, default=None, help="Stride for tile manifest generation; defaults to tile-size")
+    ap.add_argument("--perceptual-weight", type=float, default=0.0, help="Weight for perceptual (VGG) loss during training. 0 = disabled. Recommended: 0.1")
 
     return ap.parse_args()
 
@@ -779,6 +782,7 @@ def main() -> None:
         num_workers=args.num_workers,
         resume_checkpoint=args.resume_checkpoint,
         stride=args.stride,
+        perceptual_weight=args.perceptual_weight,
     )
 
 

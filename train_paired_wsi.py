@@ -17,6 +17,86 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 
+# ---------------------------------------------------------------------------
+# Perceptual loss (VGG16 feature matching)
+# ---------------------------------------------------------------------------
+
+class VGGPerceptualLoss(nn.Module):
+    """
+    Computes perceptual loss using VGG16 features (up to relu3_3).
+
+    Uses torchvision's pretrained VGG16. Weights are frozen — VGG is used
+    purely as a fixed feature extractor.
+
+    Input tensors are expected in [0, 1] RGB float32, shape [B, 3, H, W].
+    Internally normalised to ImageNet stats before passing through VGG.
+    """
+
+    # VGG16 layer index where we stop (relu1_2, relu2_2, relu3_3)
+    _LAYER_INDICES = [4, 9, 16]
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        try:
+            import torchvision.models as tvm
+        except ImportError:
+            raise ImportError(
+                "torchvision is required for perceptual loss. "
+                "Install it with: pip install torchvision"
+            )
+
+        vgg = tvm.vgg16(weights=tvm.VGG16_Weights.IMAGENET1K_V1)
+        features = vgg.features
+
+        # Split into sub-networks at each chosen layer boundary
+        prev = 0
+        self.slices = nn.ModuleList()
+        for idx in self._LAYER_INDICES:
+            self.slices.append(nn.Sequential(*list(features.children())[prev:idx + 1]))
+            prev = idx + 1
+
+        # Freeze — we never want gradients through VGG
+        for p in self.parameters():
+            p.requires_grad_(False)
+
+        # ImageNet normalisation constants (RGB order)
+        self.register_buffer(
+            "mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        )
+
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred:   [B, 3, H, W] float32 in [0, 1]
+            target: [B, 3, H, W] float32 in [0, 1]
+
+        Returns:
+            Scalar perceptual loss (mean over batch and feature layers).
+        """
+        pred_n   = self._normalize(pred)
+        target_n = self._normalize(target)
+
+        loss = torch.tensor(0.0, device=pred.device)
+        p, t = pred_n, target_n
+        for slice_net in self.slices:
+            p = slice_net(p)
+            t = slice_net(t)
+            loss = loss + F.l1_loss(p, t.detach())
+
+        return loss / len(self.slices)
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
 @dataclass
 class SlidePair:
     raw_path: Path
@@ -69,6 +149,10 @@ class TileRecord:
     split: str
 
 
+# ---------------------------------------------------------------------------
+# Image I/O
+# ---------------------------------------------------------------------------
+
 def _read_image_rgb(path: Path) -> np.ndarray:
     suffix = path.suffix.lower()
 
@@ -98,6 +182,10 @@ def _read_image_rgb(path: Path) -> np.ndarray:
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     return np.ascontiguousarray(rgb)
 
+
+# ---------------------------------------------------------------------------
+# Tile filtering / sampling helpers
+# ---------------------------------------------------------------------------
 
 def _tile_is_valid(
     rgb: np.ndarray,
@@ -138,6 +226,10 @@ def _apply_basic_aug(
 
     return raw_rgb, tgt_rgb
 
+
+# ---------------------------------------------------------------------------
+# Tile manifest helpers
+# ---------------------------------------------------------------------------
 
 def _write_tile_csv(path: Path, rows: Sequence[TileRecord], epoch: Optional[int] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -244,6 +336,10 @@ def _split_manifest(
     return train_records, val_records
 
 
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
 class TileListDataset(Dataset):
     def __init__(
         self,
@@ -277,6 +373,10 @@ class TileListDataset(Dataset):
             "xy": (rec.x, rec.y),
         }
 
+
+# ---------------------------------------------------------------------------
+# Model (SmallUNet)
+# ---------------------------------------------------------------------------
 
 class DoubleConv(nn.Module):
     def __init__(self, c_in: int, c_out: int):
@@ -349,6 +449,10 @@ class SmallUNet(nn.Module):
         return torch.sigmoid(x)
 
 
+# ---------------------------------------------------------------------------
+# DataLoader factory
+# ---------------------------------------------------------------------------
+
 def _make_loader(
     dataset: Dataset,
     batch_size: int,
@@ -365,16 +469,38 @@ def _make_loader(
     )
 
 
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+
 def _epoch_pass(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
     optimizer: Optional[torch.optim.Optimizer] = None,
-) -> float:
+    perceptual_loss_fn: Optional[VGGPerceptualLoss] = None,
+    perceptual_weight: float = 0.0,
+) -> Tuple[float, float, float]:
+    """
+    Run one epoch (train or val).
+
+    Returns
+    -------
+    total_loss   : weighted combined loss
+    l1_loss_avg  : unweighted L1 component (for logging)
+    perc_loss_avg: unweighted perceptual component (0.0 if disabled)
+    """
     training = optimizer is not None
     model.train(training)
-    total_loss = 0.0
+    total_loss_sum = 0.0
+    l1_sum = 0.0
+    perc_sum = 0.0
     total_count = 0
+
+    use_perceptual = (
+        perceptual_loss_fn is not None
+        and perceptual_weight > 0.0
+    )
 
     pbar = tqdm(loader, desc="train" if training else "val", leave=False)
 
@@ -384,7 +510,15 @@ def _epoch_pass(
 
         with torch.set_grad_enabled(training):
             pred = model(x)
-            loss = F.l1_loss(pred, y)
+
+            l1 = F.l1_loss(pred, y)
+
+            if use_perceptual:
+                perc = perceptual_loss_fn(pred, y)
+                loss = l1 + perceptual_weight * perc
+            else:
+                perc = torch.tensor(0.0)
+                loss = l1
 
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -392,11 +526,19 @@ def _epoch_pass(
                 optimizer.step()
 
         bs = x.shape[0]
-        total_loss += float(loss.item()) * bs
-        total_count += bs
-        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        total_loss_sum += float(loss.item()) * bs
+        l1_sum         += float(l1.item())   * bs
+        perc_sum       += float(perc.item()) * bs
+        total_count    += bs
 
-    return total_loss / max(total_count, 1)
+        pbar.set_postfix({
+            "loss": f"{loss.item():.4f}",
+            "l1":   f"{l1.item():.4f}",
+            **({"perc": f"{perc.item():.4f}"} if use_perceptual else {}),
+        })
+
+    n = max(total_count, 1)
+    return total_loss_sum / n, l1_sum / n, perc_sum / n
 
 
 def _take_epoch_records(
@@ -433,6 +575,10 @@ def _take_epoch_records(
     return selected, current_cursor, current_cycle, current_records
 
 
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
 def train_paired_wsi(
     pairs: Sequence[Tuple[str, str]],
     out_dir: str,
@@ -448,6 +594,7 @@ def train_paired_wsi(
     low_std_thresh: float = 5.0,
     resume_checkpoint: Optional[str] = None,
     stride: Optional[int] = None,
+    perceptual_weight: float = 0.0,
 ) -> None:
     if len(pairs) == 0:
         raise ValueError("At least one --pair RAW_TIF TARGET_TIF is required.")
@@ -463,6 +610,16 @@ def train_paired_wsi(
 
     slide_pairs = [SlidePair.open(raw, tgt) for raw, tgt in pairs]
     slide_pairs_by_name = {p.name: p for p in slide_pairs}
+
+    # --- Perceptual loss setup --------------------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    perceptual_loss_fn: Optional[VGGPerceptualLoss] = None
+    if perceptual_weight > 0.0:
+        print(f"Perceptual loss enabled  (weight={perceptual_weight})")
+        perceptual_loss_fn = VGGPerceptualLoss().to(device)
+    else:
+        print("Perceptual loss disabled  (use --perceptual-weight > 0 to enable)")
 
     print(f"Opening {len(slide_pairs)} paired TIFF slides...")
     print(f"Tile size: {tile_size}")
@@ -498,7 +655,6 @@ def train_paired_wsi(
     )
     val_loader = _make_loader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SmallUNet().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
@@ -547,53 +703,53 @@ def train_paired_wsi(
         )
         train_loader = _make_loader(train_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-        train_loss = _epoch_pass(model, train_loader, device, optimizer=optimizer)
-        val_loss = _epoch_pass(model, val_loader, device, optimizer=None)
+        train_loss, train_l1, train_perc = _epoch_pass(
+            model, train_loader, device,
+            optimizer=optimizer,
+            perceptual_loss_fn=perceptual_loss_fn,
+            perceptual_weight=perceptual_weight,
+        )
+        val_loss, val_l1, val_perc = _epoch_pass(
+            model, val_loader, device,
+            optimizer=None,
+            perceptual_loss_fn=perceptual_loss_fn,
+            perceptual_weight=perceptual_weight,
+        )
 
         epoch_pbar.set_postfix({
-            "train_l1": f"{train_loss:.4f}",
-            "val_l1": f"{val_loss:.4f}",
+            "train": f"{train_loss:.4f}",
+            "val":   f"{val_loss:.4f}",
             "cycle": train_cycle,
         })
 
+        perc_str = (
+            f"  train_perc={train_perc:.6f}  val_perc={val_perc:.6f}"
+            if perceptual_weight > 0.0 else ""
+        )
         print(
             f"Epoch {epoch:03d}/{epochs:03d}  "
-            f"train_l1={train_loss:.6f}  val_l1={val_loss:.6f}  "
+            f"train_l1={train_l1:.6f}  val_l1={val_l1:.6f}"
+            f"{perc_str}  "
             f"cycle={train_cycle}  cursor={train_cursor}/{len(train_records_shuffled)}"
         )
 
-        last_ckpt = out_path / "last.pt"
-        torch.save(
-            {
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "best_val": best_val,
-                "pairs": [(str(a), str(b)) for a, b in pairs],
-                "tile_size": tile_size,
-                "stride": stride,
-                "train_cursor": train_cursor,
-                "train_cycle": train_cycle,
-            },
-            last_ckpt,
-        )
+        ckpt_data = {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "best_val": best_val,
+            "pairs": [(str(a), str(b)) for a, b in pairs],
+            "tile_size": tile_size,
+            "stride": stride,
+            "train_cursor": train_cursor,
+            "train_cycle": train_cycle,
+            "perceptual_weight": perceptual_weight,
+        }
+
+        torch.save(ckpt_data, out_path / "last.pt")
 
         if val_loss < best_val:
             best_val = val_loss
             best_ckpt = out_path / "best.pt"
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "best_val": best_val,
-                    "pairs": [(str(a), str(b)) for a, b in pairs],
-                    "tile_size": tile_size,
-                    "stride": stride,
-                    "train_cursor": train_cursor,
-                    "train_cycle": train_cycle,
-                },
-                best_ckpt,
-            )
-        
-        print(f"  saved best -> {best_ckpt}")
+            torch.save({**ckpt_data, "best_val": best_val}, best_ckpt)
+            print(f"  saved best -> {best_ckpt}")
