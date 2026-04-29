@@ -1,4 +1,4 @@
-# pipeline.py (Version H+++ - current pipeline + paired TIFF training mode)
+# pipeline.py (Version H+++ - current pipeline + paired TIFF training mode + TIFF inference mode)
 # Python 3.8/3.9 compatible
 
 import argparse
@@ -43,6 +43,16 @@ def list_svs(root: Union[str, Path]) -> List[Path]:
     if not root_p.exists():
         return []
     return sorted([p for p in root_p.rglob("*.svs") if p.is_file()])
+
+
+def list_tiffs(root: Union[str, Path]) -> List[Path]:
+    root_p = Path(root)
+    if not root_p.exists():
+        return []
+    tiffs = []
+    for suffix in ("*.tif", "*.tiff", "*.TIF", "*.TIFF"):
+        tiffs.extend(root_p.rglob(suffix))
+    return sorted(set(tiffs))
 
 
 def _ensure_bgr_u8(img: np.ndarray) -> np.ndarray:
@@ -268,6 +278,7 @@ def run_pipeline(
     normalize: str = "0_1",
     svs_root: Optional[str] = None,
     svs_level: int = 0,
+    tiff_root: Optional[str] = None,
     export_train_pairs: bool = False,
     targets_root: Optional[str] = None,
     train_raw_out: str = "train_pairs/raw",
@@ -384,6 +395,66 @@ def run_pipeline(
             return _ensure_bgr_u8(bgr_adj), meta
 
         raise ValueError(f"Unknown method: {method}")
+
+    # ------------------------------------------------------------------ #
+    #  TIFF inference mode                                                 #
+    # ------------------------------------------------------------------ #
+    if tiff_root:
+        tiff_paths = list_tiffs(tiff_root)
+        if not tiff_paths:
+            print(f"No .tif/.tiff files found under: {tiff_root}")
+            return
+
+        print(f"Found {len(tiff_paths)} TIFF files under: {tiff_root}")
+        failed = []
+
+        for idx, tiff_path in enumerate(tiff_paths, 1):
+            name = tiff_path.stem
+            final_jpg_path = Path(final_out) / f"{name}.jpg"
+
+            if not overwrite:
+                if final_jpg_path.exists() or final_jpg_path.with_suffix(".png").exists():
+                    print(f"[{idx}/{len(tiff_paths)}] SKIP (exists): {name}")
+                    continue
+
+            print(f"\n[{idx}/{len(tiff_paths)}] Processing TIFF: {tiff_path.name}")
+
+            try:
+                bgr = _read_tif(tiff_path)
+                print(f"  read TIFF -> shape={bgr.shape} dtype={bgr.dtype}")
+            except Exception as e:
+                print(f"  [ERROR] Could not read TIFF, skipping: {tiff_path.name}")
+                print(f"          Reason: {e}")
+                failed.append((tiff_path.name, f"read error: {e}"))
+                continue
+
+            try:
+                bgr_adj, meta = _apply_method(bgr, {"source_tiff": str(tiff_path), "method": method})
+            except Exception as e:
+                print(f"  [ERROR] Adjustment failed, skipping: {tiff_path.name}")
+                print(f"          Reason: {e}")
+                failed.append((tiff_path.name, f"adjustment error: {e}"))
+                continue
+
+            try:
+                written_path, written_fmt = save_final_image_with_fallback(final_jpg_path, bgr_adj, quality=JPEG_QUALITY)
+                print(f"  saved -> {written_path}  ({written_fmt})")
+            except Exception as e:
+                print(f"  [ERROR] Could not save output, skipping: {tiff_path.name}")
+                print(f"          Reason: {e}")
+                failed.append((tiff_path.name, f"save error: {e}"))
+                continue
+
+        if failed:
+            print(f"\n{'=' * 60}")
+            print(f"FAILED FILES ({len(failed)}):")
+            for fname, reason in failed:
+                print(f"  {fname}")
+                print(f"    {reason}")
+            print(f"{'=' * 60}")
+        else:
+            print(f"\nAll {len(tiff_paths)} files processed successfully.")
+        return
 
     if export_train_pairs:
         if raw_root is None:
@@ -580,7 +651,7 @@ def run_pipeline(
 
     if raw_root is None:
         raise ValueError(
-            "raw_root is required unless --skip-stitch or --svs-root or "
+            "raw_root is required unless --skip-stitch or --svs-root or --tiff-root or "
             "--export-train-pairs or --task train_paired_wsi is used"
         )
 
@@ -619,7 +690,7 @@ def run_pipeline(
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Stitching + adjustment pipeline (supports stitched BMP, SVS, raw tile modes, exporting train pairs, and paired TIFF training)"
+        description="Stitching + adjustment pipeline (supports stitched BMP, SVS, TIFF, raw tile modes, exporting train pairs, and paired TIFF training)"
     )
 
     ap.add_argument("--task", choices=["process", "train_paired_wsi"], default="process")
@@ -635,6 +706,8 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--svs-root", help="Folder containing .svs files to process directly (no stitching needed)")
     ap.add_argument("--svs-level", type=int, default=0, help="SVS pyramid level (0=full res). Auto-steps up if exceeds SVS_MAX_DIM.")
+
+    ap.add_argument("--tiff-root", help="Folder containing .tif/.tiff files to process directly (no stitching needed)")
 
     ap.add_argument("--method", choices=["hsv", "ml", "bb"], default="hsv", help="Colorization method")
     ap.add_argument("--checkpoint", default=None, help="Path to PyTorch checkpoint for ML method (.pt)")
@@ -688,6 +761,7 @@ def main() -> None:
         normalize=args.normalize,
         svs_root=args.svs_root,
         svs_level=args.svs_level,
+        tiff_root=args.tiff_root,
         export_train_pairs=args.export_train_pairs,
         targets_root=args.targets_root,
         train_raw_out=args.train_raw_out,

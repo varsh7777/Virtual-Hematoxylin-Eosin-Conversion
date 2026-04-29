@@ -595,4 +595,5 @@ def train_paired_wsi(
                 },
                 best_ckpt,
             )
-            print(f"  saved best -> {best_ckpt}")
+        
+        print(f"  saved best -> {best_ckpt}")
