@@ -104,10 +104,18 @@ def save_final_image_with_fallback(
     final_jpg_path: Union[str, Path],
     bgr: np.ndarray,
     quality: int,
+    save_png: bool = True,
 ) -> Tuple[Path, str]:
     bgr = _ensure_bgr_u8(bgr)
-    final_jpg_path = Path(final_jpg_path).with_suffix(".jpg")
 
+    if save_png:
+        final_png_path = Path(final_jpg_path).with_suffix(".png")
+        ok = cv2.imwrite(str(final_png_path), bgr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        if not ok:
+            raise RuntimeError(f"Failed to write PNG: {final_png_path}")
+        return final_png_path, "png (lossless, compression=1)"
+
+    final_jpg_path = Path(final_jpg_path).with_suffix(".jpg")
     if _try_save_jpeg_opencv(final_jpg_path, bgr, quality):
         return final_jpg_path, f"jpeg (opencv, quality={quality})"
 
@@ -120,7 +128,6 @@ def save_final_image_with_fallback(
     ok = cv2.imwrite(str(final_png_path), bgr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
     if not ok:
         raise RuntimeError(f"Failed to write PNG: {final_png_path}")
-
     return final_png_path, "png (fallback, compression=1)"
 
 
@@ -268,6 +275,7 @@ def run_pipeline(
     final_out: str,
     num_rows: int = 0,
     overwrite: bool = False,
+    save_png: bool = True,
     skip_stitch: bool = False,
     stitched_root: Optional[str] = None,
     method: str = "hsv",
@@ -439,7 +447,7 @@ def run_pipeline(
                 continue
 
             try:
-                written_path, written_fmt = save_final_image_with_fallback(final_jpg_path, bgr_adj, quality=JPEG_QUALITY)
+                written_path, written_fmt = save_final_image_with_fallback(final_jpg_path, bgr_adj, quality=JPEG_QUALITY, save_png=save_png)
                 print(f"  saved -> {written_path}  ({written_fmt})")
             except Exception as e:
                 print(f"  [ERROR] Could not save output, skipping: {tiff_path.name}")
@@ -596,7 +604,7 @@ def run_pipeline(
                 continue
 
             try:
-                written_path, written_fmt = save_final_image_with_fallback(final_jpg_path, bgr_adj, quality=JPEG_QUALITY)
+                written_path, written_fmt = save_final_image_with_fallback(final_jpg_path, bgr_adj, quality=JPEG_QUALITY, save_png=save_png)
                 print(f"  saved -> {written_path}  ({written_fmt})")
             except Exception as e:
                 print(f"  [ERROR] Could not save output, skipping: {svs_path.name}")
@@ -646,7 +654,7 @@ def run_pipeline(
                 print(f"  [WARN] Could not write stitched BMP: {e}")
 
             bgr_adj, meta = _apply_method(bgr, {"source_bmp": str(bmp_path), "method": method})
-            written_path, written_fmt = save_final_image_with_fallback(final_jpg_path, bgr_adj, quality=JPEG_QUALITY)
+            written_path, written_fmt = save_final_image_with_fallback(final_jpg_path, bgr_adj, quality=JPEG_QUALITY, save_png=save_png)
             print(f"  saved -> {written_path}  ({written_fmt})")
 
         return
@@ -686,7 +694,7 @@ def run_pipeline(
             print(f"  [WARN] Could not write stitched BMP: {e}")
 
         bgr_adj, meta = _apply_method(bgr, {"source_folder": name, "method": method})
-        written_path, written_fmt = save_final_image_with_fallback(final_jpg_path, bgr_adj, quality=JPEG_QUALITY)
+        written_path, written_fmt = save_final_image_with_fallback(final_jpg_path, bgr_adj, quality=JPEG_QUALITY, save_png=save_png)
         print(f"  saved -> {written_path}  ({written_fmt})")
 
 
@@ -702,6 +710,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--final-out", default="final_outputs", help="Where to write final JPG/PNG")
     ap.add_argument("--num-rows", type=int, default=0, help="Optional limit on rows (0 = all)")
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
+    ap.add_argument("--save-jpeg", action="store_true", help="Save outputs as JPEG instead of the default lossless PNG")
 
     ap.add_argument("--skip-stitch", action="store_true", help="Skip stitching; process already-stitched BMPs")
     ap.add_argument("--stitched-root", help="Folder containing stitched .bmp files (required with --skip-stitch)")
@@ -754,6 +763,7 @@ def main() -> None:
         final_out=args.final_out,
         num_rows=args.num_rows,
         overwrite=args.overwrite,
+        save_png=not args.save_jpeg,
         skip_stitch=args.skip_stitch,
         stitched_root=args.stitched_root,
         method=args.method,
